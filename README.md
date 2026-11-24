@@ -25,7 +25,7 @@ python -m pip install -r requirements.txt
 python train.py --problem MW --seed 100000 --epoch 50 --num_workers 9 --device cpu
 ```
 
-Training and evaluation default to 300 FE, with 100 initial LHS points and 200 infill evaluations, up to five evaluations per candidate pool. Use `--init_fe`, `--max_fe`, and `--batch` to override these values. Training options also include `--num_seeds`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward`. Checkpoints are saved under `training_logs/codein/codein_train_<held-out-family>_set1_<timestamp>/`.
+Training and evaluation default to 300 FE, with 100 initial LHS points and 200 infill evaluations, up to five evaluations per candidate pool. Use `--init_fe`, `--max_fe`, and `--batch` to override these values. Training options also include `--parents`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward`. Checkpoints are saved under `training_logs/codein/codein_train_<held-out-family>_set1_<timestamp>/`.
 
 The default `--reward pareto` scores relative improvement in the best scaled constraint violation until the first feasible evaluation, which earns 1. With a feasible archive, an infeasible point or a dominated feasible point earns −1. A nondominated feasible point earns the Pareto improvement score using Euclidean distances to the feasible front. `--reward hv` uses the same feasibility phase and normalized HV improvement for feasible evaluations thereafter.
 

@@ -453,7 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init_fe", type=int, default=100)
     parser.add_argument("--batch", type=int, default=5, help="Evaluations per candidate pool.")
     parser.add_argument("--offspring_size", type=int, default=None)
-    parser.add_argument("--num_seeds", type=int, default=8)
+    parser.add_argument("--parents", dest="num_seeds", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--reward", type=normalize_reward, choices=REWARD_CHOICES, default=DEFAULT_REWARD)
     parser.add_argument("--logit_scale", type=float, default=5.0)
@@ -505,7 +505,7 @@ def parse_args() -> argparse.Namespace:
     if int(args.offspring_size) < 2:
         raise ValueError(f"offspring_size must be at least 2, got {args.offspring_size}.")
     if args.num_seeds < 1 or not math.isfinite(args.temperature) or args.temperature <= 0:
-        raise ValueError("num_seeds must be positive and temperature must be finite and positive.")
+        raise ValueError("parents must be positive and temperature must be finite and positive.")
     return args
 
 

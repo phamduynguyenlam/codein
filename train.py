@@ -81,7 +81,7 @@ class TrainConfig:
     rollout_device: str = "cpu"
     surrogate_device: str = "cpu"
     agent_name: str = "codein"
-    num_seeds: int = 8
+    num_seeds: int = 40
     temperature: float = 1.0
     value_coef: float = 0.5
     q_coef: float = 1.0
@@ -317,7 +317,7 @@ def parse_args(configure_parser=None):
     parser.add_argument("--reward", type=normalize_reward, choices=REWARD_CHOICES, default=DEFAULT_REWARD)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--num_seeds", type=int, default=TrainConfig.num_seeds)
+    parser.add_argument("--parents", dest="num_seeds", type=int, default=TrainConfig.num_seeds)
     parser.add_argument("--temperature", type=float, default=TrainConfig.temperature)
     parser.add_argument("--value_coef", type=float, default=TrainConfig.value_coef)
     parser.add_argument("--q_coef", type=float, default=TrainConfig.q_coef)
