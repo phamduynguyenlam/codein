@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from agents.nhis import DiscAF, NHIS, tensor_policy_state
-from solver.moead_ego_solver import run_surrogate_moead_ego
+from agents.codein import DiscAF, CodeIn, tensor_policy_state
+from solver.moead_ego import run_surrogate_moead_ego
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
 from problem.problem import DAS_PROBLEMS, MW_PROBLEMS, default_problem_dim, get_reference_point, make_problem, reference_front
 from lhs import latin_hypercube_sample as _scipy_latin_hypercube_sample
@@ -46,9 +46,9 @@ class TrainConfig:
     seed: int = 0
     num_workers: int = 24
     episodes_per_worker: int = 1
-    max_fe: int = 120
-    init_size: int = 80
-    eval_batch_size: int = 1
+    max_fe: int = 300
+    init_size: int = 100
+    eval_batch_size: int = 5
     batch_size: int = 64
     replay_size: int = 50000
     gamma: float = 0.99
@@ -77,7 +77,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     rollout_device: str = "cpu"
     surrogate_device: str = "cpu"
-    agent_name: str = "nhis"
+    agent_name: str = "codein"
     num_seeds: int = 8
     temperature: float = 1.0
     value_coef: float = 0.5
@@ -271,8 +271,8 @@ def soft_update_target_network(target_model, online_model, tau: float) -> None:
 
 def resolve_agent_cls(agent_name):
     name = str(agent_name).strip().lower()
-    if name == "nhis":
-        return NHIS
+    if name == "codein":
+        return CodeIn
     if name == "disc_af":
         return DiscAF
     raise ValueError(f"Unsupported agent_name: {agent_name}")
@@ -286,7 +286,7 @@ def build_agent_init_kwargs(cfg_like, *, epsilon=None):
         "ff_dim": int(get_value("ff_dim")),
         "dropout": float(get_value("dropout")),
     }
-    if get_value("agent_name", "nhis") == "nhis":
+    if get_value("agent_name", "codein") == "codein":
         return kwargs
     kwargs["logit_scale"] = float(get_value("logit_scale"))
     if epsilon is not None:
@@ -302,10 +302,13 @@ def select_action_from_output(out):
 
 
 def parse_args(configure_parser=None):
-    parser = argparse.ArgumentParser(description="Train NHIS with surrogate-assisted environments.")
+    parser = argparse.ArgumentParser(description="Train CodeIn with surrogate-assisted environments.")
     parser.add_argument("--problem", type=str.upper, choices=("MW", "DAS"), required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dim", type=int, default=None)
+    parser.add_argument("--init_fe", type=int, default=TrainConfig.init_size)
+    parser.add_argument("--max_fe", type=int, default=TrainConfig.max_fe)
+    parser.add_argument("--batch", type=int, default=TrainConfig.eval_batch_size, help="Evaluations per candidate pool.")
     parser.add_argument("--epoch", type=int, default=None)
     parser.add_argument("--reward_scheme", type=int, default=1, choices=[1, 2])
     parser.add_argument("--num_workers", type=int, default=None)
@@ -321,12 +324,11 @@ def parse_args(configure_parser=None):
     args.reward_norm = True
     args.surrogate_model = "gp"
     args.solver = "moead_ego"
-    args.batch = 1
     args.updates_per_epoch = None
     args.hidden_dim = None
     args.rollout_device = "cpu"
     args.surrogate_device = "cpu"
-    args.agent_name = "nhis"
+    args.agent_name = "codein"
     args.cuda_cleanup_before_update = None
     args.cuda_cleanup_after_update = None
     args.ray = False
@@ -450,7 +452,7 @@ def prediction_history_kwargs(agent, y_true_history, sigma_true_history):
     }
 
 
-def _batch_nhis_constraints(states, device, *, include_offspring):
+def _batch_codein_constraints(states, device, *, include_offspring):
     keys = ["g_true", "constraint_scale", "seed_count"]
     if include_offspring:
         keys.extend(("g_sur_mean", "g_sur_std"))
@@ -464,11 +466,11 @@ def _batch_nhis_constraints(states, device, *, include_offspring):
     return out
 
 
-def compute_nhis_init_losses(agent, decisions, device):
+def compute_codein_init_losses(agent, decisions, device):
     states, grades, _, returns = zip(*decisions)
     keys = ("x_true", "y_true", "progress", "lower_bound", "upper_bound")
     inputs = {key: to_tensor(pad_stack_rows([state[key] for state in states]), device) for key in keys}
-    inputs.update(_batch_nhis_constraints(states, device, include_offspring=False))
+    inputs.update(_batch_codein_constraints(states, device, include_offspring=False))
     inputs["archive_mask"] = torch.as_tensor(build_row_mask([state["x_true"] for state in states]), device=device)
     logits, values, mask = agent.init_policy(**inputs)
     actions = torch.as_tensor(pad_stack_rows(grades, pad_value=1), dtype=torch.long, device=device) - 1
@@ -479,7 +481,7 @@ def compute_nhis_init_losses(agent, decisions, device):
     return -(advantage * log_probs).mean(), 0.5 * (values - returns.detach()).square().mean()
 
 
-def backward_nhis_init(agent, decisions, cfg):
+def backward_codein_init(agent, decisions, cfg):
     groups = {}
     for decision in decisions:
         groups.setdefault(decision[0]["y_true"].shape[1], []).append(decision)
@@ -488,7 +490,7 @@ def backward_nhis_init(agent, decisions, cfg):
     for group in groups.values():
         for start in range(0, len(group), 4):
             chunk = group[start:start + 4]
-            init, value = compute_nhis_init_losses(agent, chunk, cfg.device)
+            init, value = compute_codein_init_losses(agent, chunk, cfg.device)
             weight = len(chunk) / len(decisions)
             (weight * (init + cfg.value_coef * value)).backward()
             policy_loss += weight * init.detach().item()
@@ -519,7 +521,7 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
         next_sigma_sur,
         next_progress,
         dones,
-        *nhis_states,
+        *codein_states,
     ) = batch
 
     device = cfg.device
@@ -626,9 +628,9 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
         + _tensor_nbytes(next_candidate_mask)
     )
 
-    if nhis_states:
-        current_kwargs = _batch_nhis_constraints(nhis_states[0], device, include_offspring=True)
-        next_kwargs = _batch_nhis_constraints(nhis_states[1], device, include_offspring=True)
+    if codein_states:
+        current_kwargs = _batch_codein_constraints(codein_states[0], device, include_offspring=True)
+        next_kwargs = _batch_codein_constraints(codein_states[1], device, include_offspring=True)
     else:
         current_kwargs = {
             "decode_type": "q_greedy",
@@ -668,13 +670,13 @@ def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
                 archive_mask=next_archive_mask,
                 candidate_mask=next_candidate_mask,
             )
-            target_kwargs = next_kwargs if nhis_states else prediction_history_kwargs(
+            target_kwargs = next_kwargs if codein_states else prediction_history_kwargs(
                 target_agent, next_y_true_history, next_sigma_true_history
             )
-            online_kwargs = next_kwargs if nhis_states else prediction_history_kwargs(
+            online_kwargs = next_kwargs if codein_states else prediction_history_kwargs(
                 agent, next_y_true_history, next_sigma_true_history
             )
-            if not nhis_states:
+            if not codein_states:
                 next_inputs["decode_type"] = "q_greedy"
             next_target = target_agent(**next_inputs, **target_kwargs)["q_values"]
             next_online = agent(**next_inputs, **online_kwargs)["q_values"]
@@ -725,7 +727,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         next_sigma_sur,
         next_progress,
         dones,
-        *nhis_states,
+        *codein_states,
     ) = batch
 
     objective_counts = [int(np.asarray(arr).shape[1]) for arr in y_true]
@@ -773,7 +775,7 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
         next_sigma_sur,
         next_progress,
         dones,
-        *nhis_states,
+        *codein_states,
     ]
 
     for n_obj, indices in groups.items():
@@ -899,7 +901,7 @@ class DiscSAEAEnv:
         self.lower_bound = np.full(self.dim, float(self.problem.lower), dtype=np.float32)
         self.upper_bound = np.full(self.dim, float(self.problem.upper), dtype=np.float32)
         self.max_steps = max(1, int(self.cfg["max_fe"]) - int(self.cfg["init_size"]))
-        self.eval_batch_size = max(1, int(self.cfg.get("eval_batch_size", 1)))
+        self.eval_batch_size = max(1, int(self.cfg.get("eval_batch_size", TrainConfig.eval_batch_size)))
         self._pool_eval_count = 0
         self.t = 0
         self.archive_x = None
@@ -1062,7 +1064,7 @@ class DiscSAEAEnv:
             if int(self.cfg.get("reward_scheme", 1)) == 2 else None
         )
         self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
-        # Pretrain surrogate on the initial archive (default: 80 points), then generate first offspring pool.
+        # Pretrain the surrogate on the initial archive, then generate the first pool.
         self._fit_surrogate()
         self._refresh_offspring()
         return self._build_state()
@@ -1173,7 +1175,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     worker_pid = os.getpid()
     device = str(cfg_dict.get("rollout_device", "cpu"))
     seed_everything(int(seed), include_cuda=str(device).startswith("cuda"))
-    agent_name = str(cfg_dict.get("agent_name", "nhis")).strip().lower()
+    agent_name = str(cfg_dict.get("agent_name", "codein")).strip().lower()
     agent_cls = resolve_agent_cls(agent_name)
     agent_init_kwargs = build_agent_init_kwargs(cfg_dict, epsilon=epsilon)
     agent = agent_cls(**agent_init_kwargs)
@@ -1181,14 +1183,14 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
 
     agent.load_state_dict(state_dict_cpu)
     agent.eval()
-    nhis = isinstance(agent, NHIS)
+    codein = isinstance(agent, CodeIn)
 
     env = DiscSAEAEnv(
         problem_name=problem_name,
         dim=int(dim),
         seed=int(seed),
         cfg_dict=cfg_dict,
-        init_policy=agent if nhis else None,
+        init_policy=agent if codein else None,
     )
     state = env.reset()
     total_reward = 0.0
@@ -1199,7 +1201,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     done = False
     while not done:
         with torch.no_grad():
-            if nhis:
+            if codein:
                 out = agent(**tensor_policy_state(state, device, include_offspring=True))
                 action = int(agent.choose_candidate(
                     out, sample=True, temperature=float(cfg_dict.get("temperature", TrainConfig.temperature))
@@ -1233,7 +1235,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
         state = next_state
 
     init_rollout = []
-    if nhis:
+    if codein:
         returns = [0.0] * len(transitions)
         discounted = 0.0
         for i in range(len(transitions) - 1, -1, -1):
@@ -1376,7 +1378,7 @@ def _normalize_episode_transition_rewards(transitions):
     return normalized_transitions
 
 
-def train_nhis(
+def train_codein(
     problem_name="MW",
     dim=None,
     seed=0,
@@ -1387,22 +1389,30 @@ def train_nhis(
     surrogate_model="gp",
     solver="moead_ego",
     num_workers=None,
-    eval_batch_size=1,
+    eval_batch_size=TrainConfig.eval_batch_size,
     updates_per_epoch=None,
     hidden_dim=None,
     device=None,
     rollout_device="cpu",
     surrogate_device="cpu",
     use_ray=False,
-    agent_name="nhis",
+    agent_name="codein",
     cuda_cleanup_before_update=None,
     cuda_cleanup_after_update=None,
     num_seeds=TrainConfig.num_seeds,
     temperature=TrainConfig.temperature,
     value_coef=TrainConfig.value_coef,
     q_coef=TrainConfig.q_coef,
+    init_fe=None,
+    max_fe=None,
 ):
     cfg = TrainConfig()
+    if init_fe is not None:
+        cfg.init_size = int(init_fe)
+    if max_fe is not None:
+        cfg.max_fe = int(max_fe)
+    if cfg.init_size < 2 or cfg.max_fe <= cfg.init_size:
+        raise ValueError("Evaluation budget requires 2 <= init_fe < max_fe.")
     cfg.seed = int(seed)
     if epoch is not None:
         cfg.train_iters = int(epoch)
@@ -1438,8 +1448,8 @@ def train_nhis(
     cfg.num_seeds = int(num_seeds)
     cfg.temperature = float(temperature)
     cfg.value_coef, cfg.q_coef = float(value_coef), float(q_coef)
-    nhis = cfg.agent_name == "nhis"
-    if nhis:
+    codein = cfg.agent_name == "codein"
+    if codein:
         cfg.policy_mode = "softmax_sample"
         cfg.reward_norm = False
         if cfg.num_seeds < 1 or not math.isfinite(cfg.temperature) or cfg.temperature <= 0:
@@ -1447,7 +1457,7 @@ def train_nhis(
         if any(not math.isfinite(coef) or coef < 0 for coef in (cfg.value_coef, cfg.q_coef)):
             raise ValueError("value_coef and q_coef must be finite and nonnegative.")
         if cfg.updates_per_epoch < 1:
-            raise ValueError("NHIS requires at least one update per rollout epoch.")
+            raise ValueError("CodeIn requires at least one update per rollout epoch.")
     if num_workers is not None:
         cfg.num_workers = int(num_workers)
     if cfg.surrogate_model != "gp":
@@ -1545,7 +1555,7 @@ def train_nhis(
         config_parts.append(f"cuda_cleanup_before_update={int(bool(cfg.cuda_cleanup_before_update))}")
     if bool(cfg.cuda_cleanup_after_update):
         config_parts.append(f"cuda_cleanup_after_update={int(bool(cfg.cuda_cleanup_after_update))}")
-    if nhis:
+    if codein:
         config_parts.extend([
             f"num_seeds={cfg.num_seeds}", f"temperature={cfg.temperature:g}",
             f"value_coef={cfg.value_coef:g}", f"q_coef={cfg.q_coef:g}",
@@ -1561,12 +1571,12 @@ def train_nhis(
         epoch = int(it) + 1
         epoch_solver = cfg.solver
         epsilon = epsilon_by_iter(it, cfg)
-        if not nhis:
+        if not codein:
             replay = ReplayBuffer(cfg.replay_size)
         epoch_cfg_dict = cfg_dict.copy()
         epoch_cfg_dict["solver"] = str(epoch_solver)
 
-        exploration = f"temperature = {cfg.temperature:g}" if nhis else f"epsilon = {epsilon:.3f}"
+        exploration = f"temperature = {cfg.temperature:g}" if codein else f"epsilon = {epsilon:.3f}"
         log(
             f"epoch {epoch}/{logged_epoch_target} | start | "
             f"solver = {epoch_solver} | {exploration}"
@@ -1677,7 +1687,7 @@ def train_nhis(
             _cleanup_cuda_cache(cfg.device, rounds=3, sleep_sec=1.0)
         update_start_time = time.perf_counter()
 
-        if len(replay) < cfg.batch_size and not nhis:
+        if len(replay) < cfg.batch_size and not codein:
             log(
                 f"epoch {epoch}/{logged_epoch_target} | reward/FE = {mean_ep_reward:.4f} | "
                 f"replay = {len(replay)} | update = skipped"
@@ -1699,7 +1709,7 @@ def train_nhis(
         total_minibatch_sample_cpu_sec = 0.0
         total_minibatch_to_gpu_sec = 0.0
         # Recompute the sampled grades under the rollout policy before changing any weights.
-        if nhis:
+        if codein:
             agent.eval()
             decisions = [decision for result in results for decision in result["init_rollout"]]
         else:
@@ -1713,10 +1723,10 @@ def train_nhis(
             total_minibatch_to_gpu_sec += float(ddqn_metrics.get("batch_to_device_sec", 0.0))
 
             optimizer.zero_grad()
-            if nhis:
+            if codein:
                 (cfg.q_coef * loss).backward()
                 if update_idx == 0:
-                    init_loss, value_loss = backward_nhis_init(agent, decisions, cfg)
+                    init_loss, value_loss = backward_codein_init(agent, decisions, cfg)
                     total_loss = init_loss + cfg.value_coef * value_loss + cfg.q_coef * loss.detach().item()
                     log(f"[Epoch {epoch:04d}] init | decisions={len(decisions)} | "
                         f"policy_loss={init_loss:.6f} | value_loss={value_loss:.6f} | total_loss={total_loss:.6f}")
@@ -1810,7 +1820,7 @@ def train_nhis(
 
 if __name__ == "__main__":
     args = parse_args()
-    train_nhis(
+    train_codein(
         problem_name=args.problem,
         dim=args.dim,
         seed=int(args.seed),
@@ -1822,6 +1832,8 @@ if __name__ == "__main__":
         solver=str(args.solver),
         num_workers=args.num_workers,
         eval_batch_size=int(args.batch),
+        init_fe=args.init_fe,
+        max_fe=args.max_fe,
         updates_per_epoch=args.updates_per_epoch,
         hidden_dim=args.hidden_dim,
         device=args.device,

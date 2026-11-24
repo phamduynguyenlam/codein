@@ -18,7 +18,7 @@ def train_disc_af_ddqn_ray(
     surrogate_model="gp",
     solver="moead_ego",
     num_workers=None,
-    eval_batch_size=1,
+    eval_batch_size=base_trainer.TrainConfig.eval_batch_size,
     updates_per_epoch=None,
     hidden_dim=None,
     device=None,
@@ -27,8 +27,10 @@ def train_disc_af_ddqn_ray(
     cuda_cleanup_before_update=True,
     cuda_cleanup_after_update=True,
     use_ray=False,
+    init_fe=None,
+    max_fe=None,
 ):
-    return base_trainer.train_nhis(
+    return base_trainer.train_codein(
         problem_name=problem_name,
         dim=dim,
         seed=seed,
@@ -40,6 +42,8 @@ def train_disc_af_ddqn_ray(
         solver=solver,
         num_workers=num_workers,
         eval_batch_size=eval_batch_size,
+        init_fe=init_fe,
+        max_fe=max_fe,
         updates_per_epoch=updates_per_epoch,
         hidden_dim=hidden_dim,
         device=device,
@@ -66,6 +70,8 @@ if __name__ == "__main__":
         solver=str(args.solver),
         num_workers=args.num_workers,
         eval_batch_size=int(args.batch),
+        init_fe=args.init_fe,
+        max_fe=args.max_fe,
         updates_per_epoch=args.updates_per_epoch,
         hidden_dim=args.hidden_dim,
         device=args.device,

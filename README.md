@@ -1,6 +1,6 @@
-# NHIS
+# CodeIn
 
-Neural Hierarchical Infill Sampling (NHIS) learns to grade archive points as seeds for MOEA/D-EGO and select offspring for black-box evaluation.
+CodeIn learns to grade archive points as seeds for MOEA/D-EGO and select offspring for black-box evaluation.
 
 ## Setup
 
@@ -25,18 +25,20 @@ python -m pip install -r requirements.txt
 python train.py --problem MW --seed 100000 --epoch 50 --num_workers 9 --device cpu
 ```
 
-The default budget is 80 initial LHS points and 40 infill evaluations. Training options include `--num_seeds`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward_scheme`. Checkpoints are saved under `training_logs/nhis/nhis_train_<held-out-family>_set1_<timestamp>/`.
+Training and evaluation default to 300 FE, with 100 initial LHS points and 200 infill evaluations, up to five evaluations per candidate pool. Use `--init_fe`, `--max_fe`, and `--batch` to override these values. Training options also include `--num_seeds`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward_scheme`. Checkpoints are saved under `training_logs/codein/codein_train_<held-out-family>_set1_<timestamp>/`.
 
 ## Evaluation
 
 Select a benchmark instance. The tester resolves the latest best-reward checkpoint for the corresponding held-out family. Use `--agent_pth` to specify a checkpoint directly.
 
 ```powershell
-python test.py --problem MW1 --seeds 0 1 2 --infill nhis --compare_infill random
-python test.py --problem DAS-CMOP7 --seed 7 --infill nhis --policy_mode softmax_sample --temperature 1.0
+python test.py --problem MW1 --seeds 0 1 2 --infill codein --compare_infill random
+python test.py --problem DAS-CMOP7 --seed 7 --infill codein --policy_mode softmax_sample --temperature 1.0
 ```
 
 `--seed` runs one seed. With neither seed option the tester chooses one seed automatically.
+
+CodeIn samples each infill candidate from softmax over the valid candidates' Q-values divided by `--temperature`. Training and evaluation both use this by default. Evaluation also accepts `--policy_mode q_greedy` for argmax.
 
 Each seed uses the same initial LHS for all compared policies. Its HV reference is 1.1 times the maximum observed initial value of each objective. HV and IGD use the feasible nondominated archive. With zero feasible solutions the log reports HV as zero and IGD as `NA`. The JSON records missing IGD as `null` and includes the valid-seed count at each FE.
 
@@ -50,4 +52,4 @@ python test.py --problem DAS-CMOP1 --seeds 0 1 --init_fe 6 --max_fe 8 --offsprin
 
 ## Problem interface
 
-Each problem returns objective and constraint matrices `(F, G)` through `evaluate_with_constraints(x)`. Feasibility means `G <= 0` for every constraint. An unconstrained problem uses `G` with shape `[N, 0]`. NHIS fixes each constraint scale to the maximum absolute initial LHS value, floored at `1e-8`.
+Each problem returns objective and constraint matrices `(F, G)` through `evaluate_with_constraints(x)`. Feasibility means `G <= 0` for every constraint. An unconstrained problem uses `G` with shape `[N, 0]`. CodeIn fixes each constraint scale to the maximum absolute initial LHS value, floored at `1e-8`.

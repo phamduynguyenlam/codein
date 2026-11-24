@@ -42,7 +42,7 @@ class _ConstraintEncoder(nn.Module):
         return _masked_mean(tokens, valid).reshape(batch_size, population_size, self.hidden_dim)
 
 
-class NHIS(BaseAgent):
+class CodeIn(BaseAgent):
     """Neural Hierarchical Infill Sampling with seed grading and infill Q-values."""
 
     def __init__(self, hidden_dim=128, n_heads=8, ff_dim=256, dropout=0.0):

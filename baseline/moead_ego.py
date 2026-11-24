@@ -2,9 +2,9 @@
 MOEA/D-EGO baseline for expensive multi-objective optimization.
 
 Setting used by default:
-    - 80 initial true evaluations (Latin hypercube)
-    - 40 additional true evaluations (one infill point per iteration)
-    - total FE = 120
+    - 100 initial true evaluations (Latin hypercube)
+    - 200 additional true evaluations, in batches of 5
+    - total FE = 300
 
 This is a compact Python implementation inspired by the public MATLAB/PlatEMO
 MOEA-D-EGO implementation from https://github.com/mobo-d/MOEAD-EGO.
@@ -19,7 +19,7 @@ Optional for CLI examples:
 
 Example:
     python moead_ego.py --problem MW1 --n-var 15 --seed 0 \
-        --init-samples 80 --infill-budget 40 --moead-pop 200 --saea_steps 30
+        --init-samples 100 --infill-budget 200 --moead-pop 200 --saea_steps 30
 """
 
 from __future__ import annotations
@@ -206,8 +206,8 @@ class RepoGPSurrogate:
 
 @dataclass
 class MOEADEGOConfig:
-    init_samples: int = 80
-    infill_budget: int = 40
+    init_samples: int = 100
+    infill_budget: int = 200
     batch_size: int = 5
     moead_pop: int = 200
     saea_steps: int = 30
@@ -661,8 +661,8 @@ def main() -> None:
     parser.add_argument("--problem", type=normalize_problem_name, choices=SUPPORTED_PROBLEMS, default="MW1")
     parser.add_argument("--dim", "--n-var", dest="dim", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--init-samples", type=int, default=80)
-    parser.add_argument("--infill-budget", type=int, default=40)
+    parser.add_argument("--init-samples", type=int, default=MOEADEGOConfig.init_samples)
+    parser.add_argument("--infill-budget", type=int, default=MOEADEGOConfig.infill_budget)
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--moead-pop", type=int, default=200)
     parser.add_argument("--saea_steps", type=int, default=30)

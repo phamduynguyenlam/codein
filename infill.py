@@ -7,7 +7,7 @@ from pymoo.util.ref_dirs import get_reference_directions
 from scipy.stats import norm
 
 from reward import pareto_front, resolve_default_reward_lambda
-from solver.moead_ego_solver import tchebycheff_gaussian_stats
+from solver.moead_ego import tchebycheff_gaussian_stats
 
 
 def _import_botorch_ehvi():

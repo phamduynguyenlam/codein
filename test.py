@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from agents.nhis import DiscAF, NHIS, tensor_policy_state
+from agents.codein import DiscAF, CodeIn, tensor_policy_state
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
 from baseline.moead_ego import propose_moead_ego_candidates
 from infill import (
@@ -37,7 +37,7 @@ from infill import (
     USeMOUncertainty,
 )
 from lhs import latin_hypercube_sample
-from solver.moead_ego_solver import run_surrogate_moead_ego
+from solver.moead_ego import run_surrogate_moead_ego
 from problem.problem import (
     SUPPORTED_PROBLEMS,
     default_problem_dim,
@@ -117,10 +117,10 @@ def default_test_log_path(args: argparse.Namespace, *, agent_name: str) -> Path:
 
 def resolve_primary_output_tag(args: argparse.Namespace, *, agent_name: str | None = None) -> str:
     primary_policy = resolve_primary_policy_name(args)
-    if primary_policy == "nhis":
+    if primary_policy == "codein":
         solver_name = str(getattr(args, "solver", "")).strip().lower().replace("-", "_")
         solver_family = canonical_solver_family_name(solver_name)
-        agent_tag = str(agent_name if agent_name is not None else getattr(args, "agent_name", "nhis")).lower()
+        agent_tag = str(agent_name if agent_name is not None else getattr(args, "agent_name", "codein")).lower()
         if solver_family is not None:
             return f"{agent_tag}_solver_{solver_family}"
         return agent_tag
@@ -195,7 +195,7 @@ def resolve_compare_algo_names(args: argparse.Namespace) -> list[str]:
     if raw_text == "":
         return []
     allowed = {
-        "nhis",
+        "codein",
         "disc_af",
         "moead_ego",
         "all",
@@ -209,7 +209,7 @@ def resolve_compare_algo_names(args: argparse.Namespace) -> list[str]:
         if token not in allowed:
             raise ValueError(
                 f"Unsupported compare_algo entry: {token}. "
-                "Expected entries from {'nhis','disc_af','moead_ego','all'}."
+                "Expected entries from {'codein','disc_af','moead_ego','all'}."
             )
         if token == "all":
             for name in ["moead_ego"]:
@@ -218,8 +218,8 @@ def resolve_compare_algo_names(args: argparse.Namespace) -> list[str]:
             continue
         if token not in resolved:
             resolved.append(token)
-    if "nhis" in resolved:
-        resolved = ["nhis"] + [token for token in resolved if token != "nhis"]
+    if "codein" in resolved:
+        resolved = ["codein"] + [token for token in resolved if token != "codein"]
     return resolved
 
 
@@ -235,13 +235,13 @@ def resolve_infill_name(args: argparse.Namespace) -> str | None:
 
 def resolve_primary_policy_name(args: argparse.Namespace) -> str:
     infill_name = resolve_infill_name(args)
-    agent_name = str(getattr(args, "agent_name", "nhis")).strip().lower().replace("-", "_")
+    agent_name = str(getattr(args, "agent_name", "codein")).strip().lower().replace("-", "_")
     if infill_name is None:
         if agent_name == "disc_af":
             return agent_name
-        return "nhis"
-    if infill_name == "nhis":
-        return "nhis"
+        return "codein"
+    if infill_name == "codein":
+        return "codein"
     if infill_name in {"disc_af", "af"}:
         return "disc_af"
     return str(infill_name)
@@ -249,8 +249,8 @@ def resolve_primary_policy_name(args: argparse.Namespace) -> str:
 
 def primary_policy_display_name(name: str) -> str:
     key = _normalize_display_key(name)
-    if key == "nhis":
-        return "NHIS"
+    if key == "codein":
+        return "CodeIn"
     if key == "disc_af":
         return "DISC w/o candidate pool interaction"
     return compare_infill_display_name(key)
@@ -258,7 +258,7 @@ def primary_policy_display_name(name: str) -> str:
 
 def is_agent_policy(name: str) -> bool:
     return str(name).strip().lower().replace("-", "_") in {
-        "nhis",
+        "codein",
         "disc_af",
     }
 
@@ -286,7 +286,7 @@ def compare_infill_display_name(name: str) -> str:
 
 def compare_algo_display_name(name: str) -> str:
     display_map = {
-        "nhis": "NHIS",
+        "codein": "CodeIn",
         "disc_af": "DISC w/o candidate pool interaction",
         "nsga2": "NSGA-II",
         "moead_ego": "MOEA-D/EGO",
@@ -297,7 +297,7 @@ def compare_algo_display_name(name: str) -> str:
 
 
 def resolve_framework_label(args: argparse.Namespace) -> str:
-    return "NHIS"
+    return "CodeIn"
 
 
 def resolve_infill_label(args: argparse.Namespace) -> str:
@@ -318,7 +318,7 @@ def resolve_solver_baseline_metadata(args: argparse.Namespace) -> tuple[str | No
     solver_name = str(getattr(args, "solver", "")).strip().lower().replace("-", "_")
     solver_family = canonical_solver_family_name(solver_name)
     if solver_family is not None:
-        return "solver_vs_baseline", "nhis_solver"
+        return "solver_vs_baseline", "codein_solver"
     return None, None
 
 
@@ -489,7 +489,7 @@ def compute_test_reward(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run NHIS-guided surrogate-assisted optimization with 80 LHS init + 40 evolution steps."
+        description="Run CodeIn-guided optimization with 100 initial + 200 optimization evaluations."
     )
     parser.add_argument("--problem", type=normalize_problem_name, default="MW1", choices=SUPPORTED_PROBLEMS)
     parser.add_argument("--dim", type=int, default=None)
@@ -497,8 +497,9 @@ def parse_args() -> argparse.Namespace:
     seeds.add_argument("--seed", default="auto")
     seeds.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--max_fe", type=int, default=120)
-    parser.add_argument("--init_fe", type=int, default=80)
+    parser.add_argument("--max_fe", type=int, default=300)
+    parser.add_argument("--init_fe", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=5, help="Evaluations per candidate pool.")
     parser.add_argument("--offspring_size", type=int, default=None)
     parser.add_argument("--num_seeds", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -508,7 +509,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--policy_mode",
         type=str,
-        default="q_greedy",
+        default="softmax_sample",
         choices=["epsilon_greedy", "q_greedy", "softmax_sample"],
         help="Decode agent Q-values with epsilon-greedy, greedy, or softmax sampling.",
     )
@@ -526,7 +527,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.surrogate_model = "gp"
     args.reward_lambda = None
-    args.batch = 1
     args.problem = str(args.problem).upper()
     args.offspring_size_user = args.offspring_size is not None
     args.saea_steps = 50
@@ -542,6 +542,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.init_fe < 2:
         parser.error("--init_fe must be at least 2.")
+    if args.batch < 1:
+        parser.error("--batch must be positive.")
     if args.seeds is not None and (len(set(args.seeds)) != len(args.seeds)
                                    or any(seed < 0 or seed >= 2**32 for seed in args.seeds)):
         parser.error("--seeds must contain distinct integers between 0 and 2**32 - 1.")
@@ -587,8 +589,8 @@ def str_to_bool(value):
 
 def resolve_agent_cls(agent_name: str):
     name = str(agent_name).strip().lower()
-    if name == "nhis":
-        return NHIS
+    if name == "codein":
+        return CodeIn
     if name == "disc_af":
         return DiscAF
     raise ValueError(f"Unsupported agent_name: {agent_name}")
@@ -732,7 +734,7 @@ def build_agent(
     args: argparse.Namespace,
     *,
     map_location: str,
-    agent_name: str = "nhis",
+    agent_name: str = "codein",
     state_dict_override: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.nn.Module, dict[str, float]]:
     agent_cls = resolve_agent_cls(agent_name)
@@ -758,7 +760,7 @@ def build_agent(
         "ff_dim": int(args.ff_dim),
         "dropout": float(args.dropout),
     }
-    if agent_cls is not NHIS:
+    if agent_cls is not CodeIn:
         agent_kwargs["logit_scale"] = float(args.logit_scale)
     model_to_device_started_at = time.perf_counter()
     disc = agent_cls(**agent_kwargs).to(map_location)
@@ -978,7 +980,7 @@ def run_policy_rollout_batched(
     archive_y = np.asarray(archive_y_init, dtype=np.float32).copy()
     archive_y_history, archive_sigma_history = init_archive_prediction_history(archive_y, history_steps=40)
     n_evo_steps = int(args.max_fe) - int(args.init_fe)
-    batch_size = max(1, int(getattr(args, "batch", 1)))
+    batch_size = max(1, int(getattr(args, "batch", 5)))
     fe_history = [int(args.init_fe)]
     archive_g = np.asarray(archive_g_init, dtype=np.float32).copy()
     front, hv, igd = feasible_metrics(archive_y, archive_g, ref_point, true_pareto)
@@ -998,20 +1000,21 @@ def run_policy_rollout_batched(
     step = 0
     pool_id = 0
     policy_key = str(policy_name).lower()
-    nhis = policy_key == "nhis"
-    if nhis:
+    codein = policy_key == "codein"
+    if codein:
         if disc is None:
-            raise ValueError("NHIS rollout requires a built NHIS agent.")
+            raise ValueError("CodeIn rollout requires a built CodeIn agent.")
         if args.policy_mode not in {"q_greedy", "softmax_sample"}:
-            raise ValueError("NHIS inference supports q_greedy or softmax_sample.")
+            raise ValueError("CodeIn inference supports q_greedy or softmax_sample.")
         scale = initial_constraint_scale(archive_g)
         bounds = {
             "lower_bound": np.full(int(args.dim), float(problem.lower), dtype=np.float32),
             "upper_bound": np.full(int(args.dim), float(problem.upper), dtype=np.float32),
         }
     while step < n_evo_steps:
+        pool_evals = min(batch_size, n_evo_steps - step)
         seed_x = None
-        if nhis:
+        if codein:
             population_size = args.offspring_size if args.offspring_size_user else len(archive_x)
             seed_count = min(int(args.num_seeds), len(archive_x), int(population_size))
             archive_state = dict(
@@ -1023,15 +1026,28 @@ def run_policy_rollout_batched(
                     sample=False, **tensor_policy_state(archive_state, args.device),
                 )
             seed_x = archive_x[indices[0].cpu().numpy()]
-        offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
-            args=args,
-            nsga_problem=nsga2_problem,
-            archive_x=archive_x,
-            archive_y=archive_y,
-            step=pool_id,
-            seed_x=seed_x,
-        )
-        if nhis:
+        if policy_key == "moead_ego":
+            offspring_x, offspring_pred, offspring_sigma, offspring_info = propose_moead_ego_candidates(
+                problem=nsga2_problem,
+                archive_x=archive_x,
+                archive_y=archive_y,
+                pop_size=int(args.offspring_size) if args.offspring_size_user else None,
+                saea_steps=int(args.saea_steps),
+                batch_size=pool_evals,
+                gp_restarts=3,
+                seed=int(args.seed) + pool_id,
+            )
+            offspring_groups = [np.arange(len(offspring_x), dtype=np.int64)]
+        else:
+            offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
+                args=args,
+                nsga_problem=nsga2_problem,
+                archive_x=archive_x,
+                archive_y=archive_y,
+                step=pool_id,
+                seed_x=seed_x,
+            )
+        if codein:
             if archive_g.shape[1]:
                 constraint_gp = build_surrogate(args, archive_x, archive_g)
                 g_sur_mean = constraint_gp.predict_mean(offspring_x)
@@ -1040,12 +1056,11 @@ def run_policy_rollout_batched(
                 g_sur_mean = np.empty((len(offspring_x), 0), dtype=np.float32)
                 g_sur_std = g_sur_mean.copy()
         pool_id += 1
-        pool_evals = min(batch_size, n_evo_steps - step)
 
         for _ in range(pool_evals):
             if step >= n_evo_steps or int(offspring_x.shape[0]) <= 0:
                 break
-            if nhis:
+            if codein:
                 state = dict(
                     x_true=archive_x, y_true=archive_y, g_true=archive_g, constraint_scale=scale,
                     seed_count=seed_count, progress=(int(args.init_fe) + step) / int(args.max_fe), **bounds,
@@ -1057,6 +1072,8 @@ def run_policy_rollout_batched(
                     selected_idx = int(disc.choose_candidate(
                         out, sample=args.policy_mode == "softmax_sample", temperature=float(args.temperature)
                     ).item())
+            elif policy_key == "moead_ego":
+                selected_idx = 0
             elif policy_key == "disc_af":
                 if disc is None:
                     raise ValueError("DISC rollout requires a built disc model.")
@@ -1130,7 +1147,7 @@ def run_policy_rollout_batched(
             selected_sigma = offspring_sigma[selected_idx]
             selected_true, selected_g = evaluate_objectives_and_constraints(problem, selected_x)
             archive_g = np.vstack((archive_g, selected_g))
-            if nhis:
+            if codein:
                 g_sur_mean = np.delete(g_sur_mean, selected_idx, axis=0)
                 g_sur_std = np.delete(g_sur_std, selected_idx, axis=0)
             step_reward = compute_test_reward(
@@ -1263,9 +1280,9 @@ def run_policy_rollout(
     reward_scheme_id: int = 1,
     true_pareto_hv: float | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
-    batch_size = max(1, int(getattr(args, "batch", 1)))
+    batch_size = max(1, int(getattr(args, "batch", 5)))
     policy_key = str(policy_name).lower()
-    if policy_key == "nhis" or (batch_size > 1 and policy_key != "moead_ego"):
+    if policy_key == "codein" or batch_size > 1:
         return run_policy_rollout_batched(
             args=args,
             problem=problem,
@@ -1314,7 +1331,7 @@ def run_policy_rollout(
                 archive_x=archive_x,
                 archive_y=archive_y,
                 pop_size=int(args.offspring_size) if bool(getattr(args, "offspring_size_user", False)) else None,
-                moead_gen=int(args.saea_steps),
+                saea_steps=int(args.saea_steps),
                 batch_size=1,
                 gp_restarts=3,
                 seed=int(args.seed) + int(step),
@@ -1682,7 +1699,7 @@ def plot_metric_curves(args, series, true_pareto, run_tag):
     return str(plot_file.resolve()), str(pdf_file)
 
 
-def main(agent_name: str = "nhis") -> None:
+def main(agent_name: str = "codein") -> None:
     args = parse_args()
     args.agent_name = str(agent_name).lower()
     primary = resolve_primary_policy_name(args)

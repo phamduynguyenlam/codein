@@ -112,7 +112,6 @@ def run_surrogate_nsga3(
     surrogate_nsga_steps=None,
 ):
     requested_pop_size = int(pop_size)
-    internal_pop_size = max(requested_pop_size, int(4 * requested_pop_size))
     if surrogate_nsga_steps is not None:
         saea_steps = surrogate_nsga_steps
     if n_gen is not None:
@@ -131,16 +130,16 @@ def run_surrogate_nsga3(
     )
 
     init_x = np.asarray(archive_x, dtype=np.float64)
-    if init_x.shape[0] >= internal_pop_size:
-        init_x = init_x[:internal_pop_size].copy()
+    if init_x.shape[0] >= requested_pop_size:
+        init_x = init_x[:requested_pop_size].copy()
     else:
         rng = np.random.default_rng(seed)
-        idx = rng.integers(0, init_x.shape[0], size=internal_pop_size)
+        idx = rng.integers(0, init_x.shape[0], size=requested_pop_size)
         init_x = init_x[idx].copy()
 
-    ref_dirs = _build_reference_directions(int(problem.n_obj), int(internal_pop_size), int(seed))
+    ref_dirs = _build_reference_directions(int(problem.n_obj), requested_pop_size, int(seed))
     algorithm = NSGA3(
-        pop_size=int(internal_pop_size),
+        pop_size=requested_pop_size,
         ref_dirs=ref_dirs,
         sampling=init_x,
         eliminate_duplicates=True,

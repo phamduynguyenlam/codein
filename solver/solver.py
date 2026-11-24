@@ -19,8 +19,6 @@ class SolverRequest:
     saea_steps: int = 25
     seed: int = 0
     n_mc: int = 128
-    acquisition: str = "ei"
-    beta: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -33,6 +31,7 @@ class SolverResult:
     std: np.ndarray | None = None
     acquisition: np.ndarray | None = None
     raw: Any | None = None
+    constraints: np.ndarray | None = None
 
 
 SolverFn = Callable[[SolverRequest], SolverResult]
@@ -88,9 +87,10 @@ class _ModelListSurrogate:
 def normalize_solver_name(name: str) -> str:
     normalized = str(name).strip().lower().replace("-", "_")
     aliases = {
+        "nsga_ii": "nsga2",
+        "nsga_2": "nsga2",
         "nsga_3": "nsga3",
         "moead_ego_solver": "moead_ego",
-        "usemo_ei": "usemo",
     }
     return aliases.get(normalized, normalized)
 
@@ -121,8 +121,6 @@ def solve(
     saea_steps: int = 25,
     seed: int = 0,
     n_mc: int = 128,
-    acquisition: str = "ei",
-    beta: float | None = None,
     surrogate_nsga_steps: int | None = None,
     **kwargs,
 ) -> SolverResult:
@@ -138,8 +136,6 @@ def solve(
         saea_steps=int(saea_steps),
         seed=int(seed),
         n_mc=int(n_mc),
-        acquisition=str(acquisition),
-        beta=beta,
         extra=dict(kwargs),
     )
     return get_solver(solver)(request)
@@ -156,7 +152,7 @@ def _require_archive_y(request: SolverRequest, solver_name: str) -> np.ndarray:
 
 
 def _solve_nsga3(request: SolverRequest) -> SolverResult:
-    from solver.nsga3_solver import run_surrogate_nsga3
+    from solver.nsga3 import run_surrogate_nsga3
 
     x, y = run_surrogate_nsga3(
         problem=request.problem,
@@ -171,8 +167,22 @@ def _solve_nsga3(request: SolverRequest) -> SolverResult:
     return SolverResult(solver="nsga3", x=np.asarray(x), y=np.asarray(y), mean=np.asarray(y), raw=(x, y))
 
 
+def _solve_nsga2(request: SolverRequest) -> SolverResult:
+    from solver.nsga2 import run_surrogate_nsga2
+
+    result = run_surrogate_nsga2(
+        problem=request.problem, archive_x=request.archive_x, pop_size=request.pop_size,
+        gps=request.gps, surrogate=request.surrogate, saea_steps=request.saea_steps,
+        seed=request.seed, **request.extra,
+    )
+    return SolverResult(
+        solver="nsga2", x=result.x, y=result.mean, mean=result.mean, raw=result,
+        constraints=result.constraints,
+    )
+
+
 def _solve_moead_ego(request: SolverRequest) -> SolverResult:
-    from solver.moead_ego_solver import run_surrogate_moead_ego
+    from solver.moead_ego import run_surrogate_moead_ego
 
     archive_y = _require_archive_y(request, "moead_ego")
     if request.surrogate is None:
@@ -198,35 +208,10 @@ def _solve_moead_ego(request: SolverRequest) -> SolverResult:
     )
 
 
-def _solve_usemo(request: SolverRequest) -> SolverResult:
-    from solver.usemo_solver import run_surrogate_usemo
-
-    archive_y = _require_archive_y(request, "usemo")
-    x, mean, std = run_surrogate_usemo(
-        problem=request.problem,
-        archive_x=request.archive_x,
-        archive_y=archive_y,
-        pop_size=int(request.pop_size),
-        saea_steps=int(request.saea_steps),
-        seed=int(request.seed),
-        acquisition=str(request.acquisition),
-        beta=request.beta,
-        **request.extra,
-    )
-    return SolverResult(
-        solver="usemo",
-        x=np.asarray(x),
-        y=np.asarray(mean),
-        mean=np.asarray(mean),
-        std=np.asarray(std),
-        raw=(x, mean, std),
-    )
-
-
 _SOLVER_REGISTRY: dict[str, SolverFn] = {
     "moead_ego": _solve_moead_ego,
+    "nsga2": _solve_nsga2,
     "nsga3": _solve_nsga3,
-    "usemo": _solve_usemo,
 }
 
 
