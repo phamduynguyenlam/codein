@@ -1,6 +1,6 @@
 # CodeIn
 
-CodeIn learns to grade archive points as seeds for MOEA/D-EGO and select offspring for black-box evaluation.
+CodeIn learns to grade archive points as seeds for constrained NSGA-II and select offspring for black-box evaluation.
 
 ## Setup
 
@@ -18,18 +18,20 @@ python -m pip install -r requirements.txt
 
 | Flag | Training benchmarks |
 | --- | --- |
-| `--problem MW` | DAS-CMOP1?9, 10 decision variables, difficulty 1 |
-| `--problem DAS` | MW1?14, 15 decision variables |
+| `--problem MW` | DAS-CMOP1?9, 8 decision variables, difficulty 1 |
+| `--problem DAS` | MW1?14, 8 decision variables |
 
 ```powershell
 python train.py --problem MW --seed 100000 --epoch 50 --num_workers 9 --device cpu
 ```
 
-Training and evaluation default to 300 FE, with 100 initial LHS points and 200 infill evaluations, up to five evaluations per candidate pool. Use `--init_fe`, `--max_fe`, and `--batch` to override these values. Training options also include `--num_seeds`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward_scheme`. Checkpoints are saved under `training_logs/codein/codein_train_<held-out-family>_set1_<timestamp>/`.
+Training and evaluation default to 300 FE, with 100 initial LHS points and 200 infill evaluations, up to five evaluations per candidate pool. Use `--init_fe`, `--max_fe`, and `--batch` to override these values. Training options also include `--num_seeds`, `--temperature`, `--value_coef`, `--q_coef`, and `--reward`. Checkpoints are saved under `training_logs/codein/codein_train_<held-out-family>_set1_<timestamp>/`.
+
+The default `--reward pareto` scores relative improvement in the best scaled constraint violation until the first feasible evaluation, which earns 1. With a feasible archive, an infeasible point or a dominated feasible point earns −1. A nondominated feasible point earns the Pareto improvement score using Euclidean distances to the feasible front. `--reward hv` uses the same feasibility phase and normalized HV improvement for feasible evaluations thereafter.
 
 ## Evaluation
 
-Select a benchmark instance. The tester resolves the latest best-reward checkpoint for the corresponding held-out family. Use `--agent_pth` to specify a checkpoint directly.
+Select a benchmark instance. Both families default to 10 decision variables at evaluation time. Train and test accept `--dim` and `--solver` overrides. NSGA-II is the default, and `--solver moead_ego` is available. Tchebycheff PI uses MOEA/D-EGO for its candidate weight vectors. The tester resolves the latest best-reward checkpoint for the corresponding held-out family and selected `--reward`. Use `--agent_pth` to specify a checkpoint directly.
 
 ```powershell
 python test.py --problem MW1 --seeds 0 1 2 --infill codein --compare_infill random
@@ -42,7 +44,7 @@ CodeIn samples each infill candidate from softmax over the valid candidates' Q-v
 
 Each seed uses the same initial LHS for all compared policies. Its HV reference is 1.1 times the maximum observed initial value of each objective. HV and IGD use the feasible nondominated archive. With zero feasible solutions the log reports HV as zero and IGD as `NA`. The JSON records missing IGD as `null` and includes the valid-seed count at each FE.
 
-The result JSON stores the reference front, each seed?s reference point and evaluation history, and the objective and constraint archives in evaluation order. PNG and PDF figures show mean ? population standard deviation for HV and IGD. IGD averages include only seeds with a defined value. DAS-CMOP reference fronts are deterministic samples generated for the 10-variable instances. MW uses the reference fronts provided by pymoo, which may fetch benchmark data on first use.
+The result JSON stores the reference front, each seed?s reference point and evaluation history, and the objective and constraint archives in evaluation order. PNG and PDF figures show mean ? population standard deviation for HV and IGD. IGD averages include only seeds with a defined value. DAS-CMOP reference fronts are deterministic samples generated for the selected dimension. MW uses the reference fronts provided by pymoo, which may fetch benchmark data on first use.
 
 ## Quick verification
 

@@ -6,7 +6,7 @@ import numpy as np
 from pymoo.util.ref_dirs import get_reference_directions
 from scipy.stats import norm
 
-from reward import pareto_front, resolve_default_reward_lambda
+from reward import pareto_front, pareto_improvement_scores, resolve_default_reward_lambda
 from solver.moead_ego import tchebycheff_gaussian_stats
 
 
@@ -135,11 +135,11 @@ class RandomSelection(InfillCriterion):
 
 
 class SurrogateParetoImprovement(InfillCriterion):
-    """Score each surrogate mean using the reward-scheme-1 Pareto proxy."""
+    """Score each surrogate mean using the Pareto-improvement proxy."""
 
     def __init__(self, *, reward_lambda: float | None = None):
         self.reward_lambda = float(
-            resolve_default_reward_lambda(1) if reward_lambda is None else reward_lambda
+            resolve_default_reward_lambda() if reward_lambda is None else reward_lambda
         )
 
     def score_candidates(
@@ -165,37 +165,7 @@ class SurrogateParetoImprovement(InfillCriterion):
                 f"got {archive.shape[1]} and {cand_mean.shape[1]}."
             )
 
-        previous_front = pareto_front(archive)
-        if previous_front.size == 0:
-            return np.full(
-                int(cand_mean.shape[0]),
-                max(1e-6, 1.0 + self.reward_lambda),
-                dtype=np.float32,
-            )
-
-        scores = np.full(int(cand_mean.shape[0]), -1.0, dtype=np.float32)
-        origin = np.zeros(previous_front.shape[1], dtype=np.float32)
-        for idx, candidate in enumerate(cand_mean):
-            weakly_better = np.all(previous_front <= candidate[None, :], axis=1)
-            strictly_better = np.any(previous_front < candidate[None, :], axis=1)
-            if bool(np.any(weakly_better & strictly_better)):
-                continue
-
-            distances = np.abs(previous_front - candidate[None, :]).sum(axis=1)
-            nearest_idx = int(np.argmin(distances))
-            d_i = float(distances[nearest_idx])
-            d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
-            scores[idx] = float(
-                max(
-                    1e-6,
-                    1.0 + self.reward_lambda * d_i / max(d_ref_i, 1e-12),
-                )
-            )
-        return scores
-
-
-# Backward-compatible descriptive name for the same proxy criterion.
-RewardScheme1ProxyMean = SurrogateParetoImprovement
+        return pareto_improvement_scores(pareto_front(archive), cand_mean, self.reward_lambda)
 
 
 class TchebycheffProbabilityOfImprovement(InfillCriterion):

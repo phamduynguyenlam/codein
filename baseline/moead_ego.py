@@ -49,7 +49,7 @@ if str(REPO_ROOT) not in sys.path:
 from lhs import latin_hypercube_sample
 from problem.problem import SUPPORTED_PROBLEMS, default_problem_dim, get_reference_point, make_problem, normalize_problem_name
 from reward import hypervolume
-from surrogate.surrogate_model import fit_gp_surrogates
+from surrogate.surrogate import fit_gp_surrogates
 
 Array = np.ndarray
 PLOT_WIDTH_4_3 = 8.0

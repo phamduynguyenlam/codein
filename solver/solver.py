@@ -35,6 +35,8 @@ class SolverResult:
 
 
 SolverFn = Callable[[SolverRequest], SolverResult]
+DEFAULT_POOL_SOLVER = "nsga2"
+POOL_SOLVERS = (DEFAULT_POOL_SOLVER, "moead_ego")
 
 
 def _surrogate_predict_mean(surrogate, x: np.ndarray) -> np.ndarray:

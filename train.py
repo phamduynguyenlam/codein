@@ -17,18 +17,20 @@ import torch.optim as optim
 import numpy as np
 
 from agents.codein import DiscAF, CodeIn, tensor_policy_state
-from solver.moead_ego import run_surrogate_moead_ego
+from solver.solver import DEFAULT_POOL_SOLVER, POOL_SOLVERS, normalize_solver_name, solve
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
-from problem.problem import DAS_PROBLEMS, MW_PROBLEMS, default_problem_dim, get_reference_point, make_problem, reference_front
+from problem.problem import DAS_PROBLEMS, DEFAULT_TRAIN_DIM, MW_PROBLEMS, get_reference_point, make_problem, reference_front
 from lhs import latin_hypercube_sample as _scipy_latin_hypercube_sample
 from reward import (
     hypervolume,
-    pareto_front,
+    DEFAULT_REWARD,
+    REWARD_CHOICES,
+    compute_env_reward,
+    feasible_mask,
+    normalize_reward,
     resolve_default_reward_lambda,
-    reward_scheme_1,
-    reward_scheme_2,
 )
-from surrogate.surrogate_model import (
+from surrogate.surrogate import (
     fit_gp_surrogates,
 )
 
@@ -65,11 +67,11 @@ class TrainConfig:
     dropout: float = 0.0
     logit_scale: float = 1.0
     surrogate_model: str = "gp"
-    solver: str = "moead_ego"
+    solver: str = DEFAULT_POOL_SOLVER
     saea_steps: int = 15
     offspring_size: int = 40
-    reward_scheme: int = 1
-    reward_lambda: float = 5.0
+    reward: str = DEFAULT_REWARD
+    reward_lambda: float | None = None
     reward_norm: bool = True
     policy_mode: str = "epsilon_greedy"
     heldout_problem: str = "MW"
@@ -305,12 +307,13 @@ def parse_args(configure_parser=None):
     parser = argparse.ArgumentParser(description="Train CodeIn with surrogate-assisted environments.")
     parser.add_argument("--problem", type=str.upper, choices=("MW", "DAS"), required=True)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--dim", type=int, default=None)
+    parser.add_argument("--dim", type=int, default=DEFAULT_TRAIN_DIM)
+    parser.add_argument("--solver", type=normalize_solver_name, choices=POOL_SOLVERS, default=DEFAULT_POOL_SOLVER)
     parser.add_argument("--init_fe", type=int, default=TrainConfig.init_size)
     parser.add_argument("--max_fe", type=int, default=TrainConfig.max_fe)
     parser.add_argument("--batch", type=int, default=TrainConfig.eval_batch_size, help="Evaluations per candidate pool.")
     parser.add_argument("--epoch", type=int, default=None)
-    parser.add_argument("--reward_scheme", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--reward", type=normalize_reward, choices=REWARD_CHOICES, default=DEFAULT_REWARD)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_seeds", type=int, default=TrainConfig.num_seeds)
@@ -323,7 +326,6 @@ def parse_args(configure_parser=None):
     args.gamma = 0.99
     args.reward_norm = True
     args.surrogate_model = "gp"
-    args.solver = "moead_ego"
     args.updates_per_epoch = None
     args.hidden_dim = None
     args.rollout_device = "cpu"
@@ -376,14 +378,18 @@ def make_nsga2_problem_adapter(problem, n_obj):
     return _ProblemAdapter()
 
 
-def generate_offspring_pool(cfg_dict, archive_x, archive_y, nsga2_problem, seed, seed_x=None):
+def generate_offspring_pool(cfg_dict, archive_x, archive_y, nsga2_problem, seed, seed_x=None,
+                            constraint_surrogate=None):
     surrogate = build_named_surrogate_from_cfg(
         cfg_dict,
         archive_x=archive_x,
         archive_y=archive_y,
         surrogate_name="gp",
     )
-    result = run_surrogate_moead_ego(
+    solver_name = normalize_solver_name(cfg_dict.get("solver", DEFAULT_POOL_SOLVER))
+    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name == "nsga2" else {}
+    result = solve(
+        solver_name,
         problem=nsga2_problem,
         archive_x=archive_x,
         archive_y=archive_y,
@@ -392,12 +398,13 @@ def generate_offspring_pool(cfg_dict, archive_x, archive_y, nsga2_problem, seed,
         saea_steps=int(cfg_dict.get("saea_steps", TrainConfig.saea_steps)),
         seed=int(seed),
         seed_x=seed_x,
+        **solver_kwargs,
     )
     return (
         surrogate,
         np.asarray(result.x, dtype=np.float32),
         np.asarray(result.mean, dtype=np.float32),
-        np.asarray(result.std, dtype=np.float32),
+        np.asarray(result.std if result.std is not None else surrogate.predict_std(result.x), dtype=np.float32),
         {},
     )
 
@@ -837,50 +844,15 @@ def compute_ddqn_loss(agent, target_agent, batch, cfg):
     return weighted_loss, metrics
 
 
-def compute_env_reward(
-    previous_archive_y,
-    selected_y,
-    ref_point,
-    reward_scheme_id,
-    reward_lambda=5.0,
-    true_pareto_hv=None,
-):
-    previous_front = pareto_front(np.asarray(previous_archive_y, dtype=np.float32))
-    selected_y = np.asarray(selected_y, dtype=np.float32)
-
-    if int(reward_scheme_id) == 1:
-        return float(
-            reward_scheme_1(
-                previous_front=previous_front,
-                selected_objectives=selected_y,
-                ref_point=ref_point,
-                reward_lambda=float(reward_lambda),
-            )
-        )
-    if int(reward_scheme_id) == 2:
-        if true_pareto_hv is None:
-            raise ValueError("reward_scheme_2 requires true_pareto_hv.")
-        return float(
-            reward_scheme_2(
-                previous_front=previous_front,
-                selected_objectives=selected_y,
-                ref_point=ref_point,
-                true_pareto_hv=float(true_pareto_hv),
-                reward_lambda=float(reward_lambda),
-            )
-        )
-    raise ValueError(f"Unsupported reward_scheme: {reward_scheme_id}")
-
-
 def build_training_env_specs(problem_name, dim=None):
     heldout = str(problem_name).upper()
     if heldout not in {"MW", "DAS"}:
         raise ValueError("Training --problem must be MW or DAS.")
     benchmarks = DAS_PROBLEMS if heldout == "MW" else MW_PROBLEMS
-    expected_dim = default_problem_dim(benchmarks[0])
-    if dim is not None and int(dim) != expected_dim:
-        raise ValueError(f"Training with --problem {heldout} uses {expected_dim} decision variables.")
-    return [{"problem_name": name, "dim": expected_dim} for name in benchmarks]
+    train_dim = DEFAULT_TRAIN_DIM if dim is None else int(dim)
+    if train_dim < 3:
+        raise ValueError("Training requires at least 3 decision variables.")
+    return [{"problem_name": name, "dim": train_dim} for name in benchmarks]
 
 
 def env_key(problem_name, dim):
@@ -961,6 +933,10 @@ class DiscSAEAEnv:
                 )
             self.init_decisions.append((self.t, state, grades[0].cpu().numpy(), log_probs[0].cpu().numpy()))
             seed_x = self.archive_x[indices[0].cpu().numpy()]
+        constraint_surrogate = None
+        solver_name = normalize_solver_name(self.cfg.get("solver", DEFAULT_POOL_SOLVER))
+        if self.archive_g.shape[1] and (self.init_policy is not None or solver_name == "nsga2"):
+            constraint_surrogate = build_surrogate_from_cfg(self._surrogate_cfg(), self.archive_x, self.archive_g)
         surrogate, offspring_x, offspring_y, offspring_sigma, offspring_info = generate_offspring_pool(
             self._surrogate_cfg(),
             archive_x=self.archive_x,
@@ -968,6 +944,7 @@ class DiscSAEAEnv:
             nsga2_problem=self.nsga2_problem,
             seed=int(self.seed) + int(self.t),
             seed_x=seed_x,
+            constraint_surrogate=constraint_surrogate,
         )
         self.surrogate = surrogate
         self.offspring_x = np.asarray(offspring_x, dtype=np.float32)
@@ -975,15 +952,13 @@ class DiscSAEAEnv:
         self.offspring_sigma = np.asarray(offspring_sigma, dtype=np.float32)
         self.offspring_info = dict(offspring_info)
         if self.init_policy is not None:
-            self.g_sur_mean, self.g_sur_std = self._predict_constraints()
+            if constraint_surrogate is None:
+                self.g_sur_mean = np.empty((len(self.offspring_x), 0), dtype=np.float32)
+                self.g_sur_std = self.g_sur_mean.copy()
+            else:
+                self.g_sur_mean = constraint_surrogate.predict_mean(self.offspring_x)
+                self.g_sur_std = constraint_surrogate.predict_std(self.offspring_x)
         self._pool_eval_count = 0
-
-    def _predict_constraints(self):
-        if self.archive_g.shape[1] == 0:
-            empty = np.empty((len(self.offspring_x), 0), dtype=np.float32)
-            return empty, empty.copy()
-        surrogate = build_surrogate_from_cfg(self._surrogate_cfg(), self.archive_x, self.archive_g)
-        return surrogate.predict_mean(self.offspring_x), surrogate.predict_std(self.offspring_x)
 
     def _remove_offspring_candidate(self, selected_idx: int) -> None:
         n_candidates = int(np.asarray(self.offspring_x).shape[0])
@@ -1058,10 +1033,10 @@ class DiscSAEAEnv:
         else:
             self.init_decisions = []
         self.ref_point = get_reference_point(self.archive_y)
-        self.init_hv = float(hypervolume(self.archive_y, self.ref_point))
+        self.init_hv = self.current_hv()
         self.true_pareto_hv = (
-            hypervolume(reference_front(self.problem_name), self.ref_point)
-            if int(self.cfg.get("reward_scheme", 1)) == 2 else None
+            hypervolume(reference_front(self.problem_name, self.dim), self.ref_point)
+            if normalize_reward(self.cfg.get("reward", DEFAULT_REWARD)) == "hv" else None
         )
         self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
         # Pretrain the surrogate on the initial archive, then generate the first pool.
@@ -1072,11 +1047,21 @@ class DiscSAEAEnv:
     def step(self, action_idx, state):
         del state
         chosen_idx = int(np.clip(int(action_idx), 0, int(self.offspring_x.shape[0]) - 1))
-        previous_archive_y = np.asarray(self.archive_y, dtype=np.float32).copy()
         chosen_x = self.offspring_x[chosen_idx : chosen_idx + 1]
         chosen_pred = np.asarray(self.offspring_y[chosen_idx : chosen_idx + 1], dtype=np.float32)
         chosen_sigma = np.asarray(self.offspring_sigma[chosen_idx : chosen_idx + 1], dtype=np.float32)
         chosen_y, chosen_g = evaluate_objectives_and_constraints(self.problem, chosen_x)
+        reward = compute_env_reward(
+            previous_archive_y=self.archive_y,
+            previous_archive_g=self.archive_g,
+            selected_y=chosen_y,
+            selected_g=chosen_g,
+            constraint_scale=self.constraint_scale,
+            ref_point=self.ref_point,
+            reward=self.cfg.get("reward", DEFAULT_REWARD),
+            reward_lambda=self.cfg.get("reward_lambda"),
+            true_pareto_hv=self.true_pareto_hv,
+        )
         self.archive_g = np.vstack((self.archive_g, chosen_g))
         if self.init_policy is None:
             history_steps = self.archive_y_history.shape[1]
@@ -1090,15 +1075,6 @@ class DiscSAEAEnv:
 
         self.archive_x = np.vstack([self.archive_x, chosen_x]).astype(np.float32)
         self.archive_y = np.vstack([self.archive_y, chosen_y]).astype(np.float32)
-
-        reward = compute_env_reward(
-            previous_archive_y=previous_archive_y,
-            selected_y=chosen_y,
-            ref_point=self.ref_point,
-            reward_scheme_id=int(self.cfg["reward_scheme"]),
-            reward_lambda=float(self.cfg.get("reward_lambda", 5.0)),
-            true_pareto_hv=self.true_pareto_hv,
-        )
 
         self.t += 1
         done = self.t >= self.max_steps
@@ -1122,7 +1098,7 @@ class DiscSAEAEnv:
         return self._build_state(), float(reward), bool(done)
 
     def current_hv(self):
-        return float(hypervolume(np.asarray(self.archive_y, dtype=np.float32), self.ref_point))
+        return hypervolume(self.archive_y[feasible_mask(self.archive_g)], self.ref_point)
 
 
 def _transition_from_states(state, action, reward, next_state, done):
@@ -1323,11 +1299,11 @@ def save_training_checkpoint(
     best_state_dict=None,
 ):
     os.makedirs(cfg.weight_dir, exist_ok=True)
-    rs_tag = f"rs{int(cfg.reward_scheme)}"
+    reward_tag = f"reward_{normalize_reward(cfg.reward)}"
     hidden_tag = f"h{int(cfg.hidden_dim)}"
     problem_tag = str(problem_name).lower()
     agent_tag = str(getattr(cfg, "agent_log_key", cfg.agent_name)).lower()
-    file_prefix = f"{agent_tag}_problem_{problem_tag}_{rs_tag}_{hidden_tag}"
+    file_prefix = f"{agent_tag}_problem_{problem_tag}_{reward_tag}_{hidden_tag}"
 
     if mean_reward > best_reward:
         best_path = os.path.join(cfg.weight_dir, f"{file_prefix}_best_reward.pth")
@@ -1336,7 +1312,7 @@ def save_training_checkpoint(
             {
                 "epoch": int(epoch),
                 "problem_name": str(problem_name),
-                "reward_scheme": int(cfg.reward_scheme),
+                "reward": normalize_reward(cfg.reward),
                 "mean_reward": float(mean_reward),
                 "state_dict": state_dict_to_save,
             },
@@ -1349,7 +1325,7 @@ def save_training_checkpoint(
         {
             "epoch": int(epoch),
             "problem_name": str(problem_name),
-            "reward_scheme": int(cfg.reward_scheme),
+            "reward": normalize_reward(cfg.reward),
             "mean_reward": float(mean_reward),
             "state_dict": agent.state_dict(),
         },
@@ -1384,10 +1360,10 @@ def train_codein(
     seed=0,
     epoch=None,
     gamma=None,
-    reward_scheme=1,
+    reward=DEFAULT_REWARD,
     reward_norm=False,
     surrogate_model="gp",
-    solver="moead_ego",
+    solver=DEFAULT_POOL_SOLVER,
     num_workers=None,
     eval_batch_size=TrainConfig.eval_batch_size,
     updates_per_epoch=None,
@@ -1418,11 +1394,11 @@ def train_codein(
         cfg.train_iters = int(epoch)
     if gamma is not None:
         cfg.gamma = float(gamma)
-    cfg.reward_scheme = int(reward_scheme)
-    cfg.reward_lambda = float(resolve_default_reward_lambda(cfg.reward_scheme))
+    cfg.reward = normalize_reward(reward)
+    cfg.reward_lambda = float(resolve_default_reward_lambda(cfg.reward))
     cfg.reward_norm = bool(reward_norm)
     cfg.surrogate_model = str(surrogate_model).lower()
-    cfg.solver = str(solver).lower()
+    cfg.solver = normalize_solver_name(solver)
     default_cleanup = True
     cfg.cuda_cleanup_before_update = (
         bool(default_cleanup)
@@ -1462,8 +1438,8 @@ def train_codein(
         cfg.num_workers = int(num_workers)
     if cfg.surrogate_model != "gp":
         raise ValueError(f"Unsupported surrogate_model: {cfg.surrogate_model}. Expected 'gp'.")
-    if cfg.solver != "moead_ego":
-        raise ValueError(f"Unsupported trainer solver: {cfg.solver}. Expected 'moead_ego'.")
+    if cfg.solver not in POOL_SOLVERS:
+        raise ValueError(f"Unsupported trainer solver: {cfg.solver}. Expected one of {POOL_SOLVERS}.")
     env_specs = build_training_env_specs(cfg.heldout_problem, dim)
     if int(cfg.num_workers) <= 0:
         raise ValueError(f"num_workers must be positive, got {cfg.num_workers}.")
@@ -1526,7 +1502,7 @@ def train_codein(
         f"workers={actual_num_workers}",
         f"init_fe={cfg.init_size}",
         f"max_fe={cfg.max_fe}",
-        f"reward_scheme={cfg.reward_scheme}",
+        f"reward={cfg.reward}",
         f"reward_lambda={cfg.reward_lambda:.4f}",
         f"reward_norm={int(bool(cfg.reward_norm))}",
         f"agent={cfg.agent_name}",
@@ -1826,7 +1802,7 @@ if __name__ == "__main__":
         seed=int(args.seed),
         epoch=args.epoch,
         gamma=args.gamma,
-        reward_scheme=int(args.reward_scheme),
+        reward=args.reward,
         reward_norm=bool(args.reward_norm),
         surrogate_model=str(args.surrogate_model),
         solver=str(args.solver),

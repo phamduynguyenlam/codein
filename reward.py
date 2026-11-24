@@ -5,22 +5,29 @@ from pymoo.indicators.hv import HV
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 
-DEFAULT_REWARD_LAMBDAS: dict[int, float] = {
-    1: 5.0,
-    2: 1.0,
-}
+DEFAULT_REWARD = "pareto"
+DEFAULT_REWARD_LAMBDAS = {"pareto": 5.0, "hv": 1.0}
+REWARD_CHOICES = tuple(DEFAULT_REWARD_LAMBDAS)
 
 
-def resolve_default_reward_lambda(reward_scheme: int) -> float:
-    return float(DEFAULT_REWARD_LAMBDAS.get(int(reward_scheme), 5.0))
+def normalize_reward(reward: str) -> str:
+    name = str(reward).strip().lower()
+    name = {"1": "pareto", "2": "hv"}.get(name, name)
+    if name not in DEFAULT_REWARD_LAMBDAS:
+        raise ValueError(f"Unsupported reward: {reward}. Expected one of {REWARD_CHOICES}.")
+    return name
+
+
+def resolve_default_reward_lambda(reward: str = DEFAULT_REWARD) -> float:
+    return DEFAULT_REWARD_LAMBDAS[normalize_reward(reward)]
 
 
 def pareto_front(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
-    if values.size == 0:
-        return values.reshape(0, 0).astype(np.float32)
     if values.ndim != 2:
         raise ValueError(f"values must be 2D, got shape={values.shape}")
+    if len(values) == 0:
+        return values
 
     keep = NonDominatedSorting().do(values, only_non_dominated_front=True)
     return values[np.asarray(keep, dtype=np.int64)]
@@ -33,67 +40,35 @@ def hypervolume(values: np.ndarray, ref_point: np.ndarray) -> float:
     return float(HV(ref_point=np.asarray(ref_point, dtype=np.float32))(front))
 
 
-def _filter_candidates_on_front(
-    selected_objectives: np.ndarray,
-    combined_front: np.ndarray,
-    *,
-    atol: float = 1e-6,
-) -> np.ndarray:
-    selected_arr = np.asarray(selected_objectives, dtype=np.float32)
-    if selected_arr.ndim == 1:
-        selected_arr = selected_arr.reshape(1, -1)
-    combined_arr = np.asarray(combined_front, dtype=np.float32)
-    if combined_arr.size == 0:
-        return selected_arr[:0]
-
-    keep: list[np.ndarray] = []
-    for candidate in selected_arr:
-        matches = np.isclose(combined_arr, candidate[None, :], atol=float(atol), rtol=0.0)
-        if bool(np.any(np.all(matches, axis=1))):
-            keep.append(candidate)
-
-    if len(keep) == 0:
-        return np.empty((0, selected_arr.shape[1]), dtype=np.float32)
-    return np.asarray(keep, dtype=np.float32)
+def feasible_mask(constraints: np.ndarray) -> np.ndarray:
+    return (constraints <= 0).all(axis=1)
 
 
-def reward_scheme_1(
-    *,
-    previous_front: np.ndarray,
-    selected_objectives: np.ndarray,
-    ref_point: np.ndarray,
-    reward_lambda: float = DEFAULT_REWARD_LAMBDAS[1],
-) -> float:
-    """Distance-to-front reward, scaled and offset; positive iff a new point stays on the updated Pareto front."""
-    previous_front = pareto_front(np.asarray(previous_front, dtype=np.float32))
-    selected_objectives = np.asarray(selected_objectives, dtype=np.float32)
-    combined_front = pareto_front(np.vstack([previous_front, selected_objectives]))
-    front_members = _filter_candidates_on_front(selected_objectives, combined_front)
-    if front_members.shape[0] == 0:
-        return -1.0
-
-    if previous_front.size == 0:
-        return float(max(1e-6, 1.0 + float(reward_lambda) * float(front_members.shape[0])))
-
-    reward = 0.0
-    origin = np.zeros(previous_front.shape[1], dtype=np.float32)
-    for candidate in front_members:
-        distances = np.abs(previous_front - candidate).sum(axis=1)
-        nearest_idx = int(np.argmin(distances))
-        d_i = float(distances[nearest_idx])
-        d_ref_i = float(np.abs(previous_front[nearest_idx] - origin).sum())
-        reward += d_i / max(d_ref_i, 1e-12)
-    return float(max(1e-6, 1.0 + float(reward_lambda) * reward))
+def pareto_improvement_scores(previous_front, candidates, reward_lambda):
+    """Score candidates independently using Euclidean distances to a fixed front."""
+    front = np.asarray(previous_front, dtype=np.float64)
+    candidates = np.atleast_2d(np.asarray(candidates, dtype=np.float64))
+    if not len(front):
+        return np.ones(len(candidates), dtype=np.float32)
+    scores = np.full(len(candidates), -1.0, dtype=np.float32)
+    for i, candidate in enumerate(candidates):
+        if ((front <= candidate).all(axis=1) & (front < candidate).any(axis=1)).any():
+            continue
+        distances = np.linalg.norm(front - candidate, axis=1)
+        nearest = int(np.argmin(distances))
+        d_ref = max(float(np.linalg.norm(front[nearest])), 1e-12)
+        scores[i] = max(1e-6, 1.0 + float(reward_lambda) * distances[nearest] / d_ref)
+    return scores
 
 
-def reward_scheme_2(
+def _hv_improvement(
     *,
     previous_front: np.ndarray,
     selected_objectives: np.ndarray,
     ref_point: np.ndarray,
     true_pareto_hv: float,
     hv_epsilon: float = 1e-8,
-    reward_lambda: float = DEFAULT_REWARD_LAMBDAS[2],
+    reward_lambda: float = DEFAULT_REWARD_LAMBDAS["hv"],
 ) -> float:
     """Normalized HV improvement against the remaining gap to the true Pareto-front HV."""
     previous_front = np.asarray(previous_front, dtype=np.float32)
@@ -106,3 +81,47 @@ def reward_scheme_2(
         return 0.0
     remaining_gap = max(float(true_pareto_hv) - float(next_hv), float(hv_epsilon))
     return float(float(reward_lambda) * (float(next_hv) - float(prev_hv)) / remaining_gap)
+
+
+def compute_env_reward(
+    *,
+    previous_archive_y: np.ndarray,
+    previous_archive_g: np.ndarray,
+    selected_y: np.ndarray,
+    selected_g: np.ndarray,
+    constraint_scale: np.ndarray,
+    ref_point: np.ndarray,
+    reward: str = DEFAULT_REWARD,
+    reward_lambda: float | None = None,
+    true_pareto_hv: float | None = None,
+) -> float:
+    """Evaluate one selected point using observations from before its insertion."""
+    reward = normalize_reward(reward)
+    previous_feasible = feasible_mask(previous_archive_g)
+    selected_g = np.atleast_2d(selected_g)
+    (selected_is_feasible,) = feasible_mask(selected_g)
+    if not previous_feasible.any():
+        if selected_is_feasible:
+            return 1.0
+        if not len(previous_archive_g):
+            return 0.0
+        epsilon = 1e-8
+        scale = np.maximum(np.asarray(constraint_scale, dtype=np.float64), epsilon)
+        old_best = np.maximum(previous_archive_g / scale, 0.0).sum(axis=1).min()
+        new_violation = np.maximum(selected_g / scale, 0.0).sum()
+        new_best = min(old_best, new_violation)
+        return float((old_best - new_best) / max(old_best, epsilon))
+
+    if not selected_is_feasible:
+        return -1.0
+
+    front = pareto_front(previous_archive_y[previous_feasible])
+    weight = resolve_default_reward_lambda(reward) if reward_lambda is None else float(reward_lambda)
+    if reward == "pareto":
+        return float(pareto_improvement_scores(front, selected_y, weight)[0])
+    if true_pareto_hv is None:
+        raise ValueError("The hv reward requires true_pareto_hv.")
+    return _hv_improvement(
+        previous_front=front, selected_objectives=np.atleast_2d(selected_y),
+        ref_point=ref_point, true_pareto_hv=true_pareto_hv, reward_lambda=weight,
+    )

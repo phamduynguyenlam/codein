@@ -5,7 +5,6 @@ import inspect
 import json
 import math
 import os
-import re
 import secrets
 import sys
 import time
@@ -37,7 +36,7 @@ from infill import (
     USeMOUncertainty,
 )
 from lhs import latin_hypercube_sample
-from solver.moead_ego import run_surrogate_moead_ego
+from solver.solver import DEFAULT_POOL_SOLVER, POOL_SOLVERS, normalize_solver_name, solve
 from problem.problem import (
     SUPPORTED_PROBLEMS,
     default_problem_dim,
@@ -51,10 +50,13 @@ from reward import (
     hypervolume,
     pareto_front,
     resolve_default_reward_lambda,
-    reward_scheme_1,
-    reward_scheme_2,
+    DEFAULT_REWARD,
+    REWARD_CHOICES,
+    compute_env_reward,
+    feasible_mask,
+    normalize_reward,
 )
-from surrogate.surrogate_model import (
+from surrogate.surrogate import (
     estimate_uncertainty,
     fit_gp_surrogates,
     surrogate_model_name,
@@ -86,9 +88,8 @@ def make_test_logger(log_path: Path | None):
 
 
 def default_test_log_dir(args: argparse.Namespace) -> Path:
-    agent_pth = str(getattr(args, "agent_pth", "") or "").strip().lower()
-    if "_rs2_" in agent_pth:
-        return Path("testing_logs") / "rs2" / str(args.problem).upper()
+    if getattr(args, "reward", DEFAULT_REWARD) == "hv":
+        return Path("testing_logs") / "hv" / str(args.problem).upper()
     return Path("testing_logs") / str(args.problem).upper()
 
 
@@ -309,6 +310,8 @@ def canonical_solver_family_name(name: str | None) -> str | None:
     if name is None:
         return None
     key = str(name).strip().lower().replace("-", "_").replace("/", "_")
+    if normalize_solver_name(key) == "nsga2":
+        return "nsga2"
     if key in {"moead_ego", "moea_d_ego"}:
         return "moead_ego"
     return None
@@ -383,22 +386,6 @@ def _make_infill_selection_kwargs(
     return kwargs
 
 
-def resolve_test_reward_scheme(args: argparse.Namespace) -> int:
-    agent_pth = getattr(args, "agent_pth", None)
-    if not agent_pth:
-        return 1
-    match = re.search(r"rs(\d+)", Path(str(agent_pth)).name.lower())
-    if match is None:
-        return 1
-    reward_scheme_id = int(match.group(1))
-    if reward_scheme_id not in {1, 2}:
-        raise ValueError(
-            f"Unsupported reward scheme tag rs{reward_scheme_id} in checkpoint filename; "
-            "expected rs1 or rs2."
-        )
-    return reward_scheme_id
-
-
 def is_random_agent_path(agent_pth: str | None) -> bool:
     return agent_pth is not None and str(agent_pth).strip().lower() in {"random", "random_model"}
 
@@ -406,8 +393,9 @@ def is_random_agent_path(agent_pth: str | None) -> bool:
 def resolve_default_best_reward_checkpoint(args: argparse.Namespace) -> str:
     policy_name = resolve_primary_policy_name(args)
     checkpoint_root = Path("training_logs") / policy_name
+    reward_name = normalize_reward(getattr(args, "reward", DEFAULT_REWARD))
     filename_pattern = (
-        f"{policy_name}_problem_{problem_family(args.problem).lower()}_*_best_reward.pth"
+        f"{policy_name}_problem_{problem_family(args.problem).lower()}_reward_{reward_name}_*_best_reward.pth"
     )
     candidates = [
         path
@@ -419,9 +407,6 @@ def resolve_default_best_reward_checkpoint(args: argparse.Namespace) -> str:
             f"No best-reward checkpoint found for {policy_name} on {args.problem} "
             f"under {checkpoint_root}."
         )
-    rs1_candidates = [path for path in candidates if "_rs1_" in path.name.lower()]
-    if rs1_candidates:
-        candidates = rs1_candidates
     selected = max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
     return str(selected.resolve())
 
@@ -454,39 +439,6 @@ def format_policy_prefix(policy_name: str) -> str:
     return f"[{str(policy_name).strip().lower().replace('-', '_')}] "
 
 
-def compute_test_reward(
-    *,
-    reward_scheme_id: int,
-    previous_front: np.ndarray,
-    selected_objectives: np.ndarray,
-    ref_point: np.ndarray,
-    reward_lambda: float,
-    true_pareto_hv: float | None = None,
-) -> float:
-    if int(reward_scheme_id) == 1:
-        return float(
-            reward_scheme_1(
-                previous_front=previous_front,
-                selected_objectives=selected_objectives,
-                ref_point=ref_point,
-                reward_lambda=float(reward_lambda),
-            )
-        )
-    if int(reward_scheme_id) == 2:
-        if true_pareto_hv is None:
-            raise ValueError("reward_scheme_2 requires true_pareto_hv in tester.")
-        return float(
-            reward_scheme_2(
-                previous_front=previous_front,
-                selected_objectives=selected_objectives,
-                ref_point=ref_point,
-                true_pareto_hv=float(true_pareto_hv),
-                reward_lambda=float(reward_lambda),
-            )
-        )
-    raise ValueError(f"Unsupported reward_scheme_id for tester: {reward_scheme_id}")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run CodeIn-guided optimization with 100 initial + 200 optimization evaluations."
@@ -503,6 +455,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offspring_size", type=int, default=None)
     parser.add_argument("--num_seeds", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--reward", type=normalize_reward, choices=REWARD_CHOICES, default=DEFAULT_REWARD)
     parser.add_argument("--logit_scale", type=float, default=5.0)
     parser.add_argument("--agent_pth", type=str, default=None)
     parser.add_argument("--random_model", action="store_true")
@@ -521,7 +474,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare_infill", type=str, default=None)
     parser.add_argument("--compare_algo", type=str, default=None)
     parser.add_argument("--compare_agent_pth", type=str, default=None)
-    parser.add_argument("--solver", default="moead_ego", choices=["moead_ego"])
+    parser.add_argument("--solver", type=normalize_solver_name, choices=POOL_SOLVERS, default=DEFAULT_POOL_SOLVER)
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--plot_path", type=str, default=None)
     args = parser.parse_args()
@@ -632,30 +585,44 @@ def generate_offspring_pool(
     archive_y: np.ndarray,
     step: int,
     seed_x: np.ndarray | None = None,
+    constraint_surrogate=None,
+    solver_name: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray], dict[str, Any]]:
-    solver_name = str(getattr(args, "solver", "moead_ego")).lower()
-    if solver_name != "moead_ego":
-        raise ValueError(f"Unsupported solver: {solver_name}")
-    result = run_surrogate_moead_ego(
+    if solver_name is None:
+        solver_name = normalize_solver_name(getattr(args, "solver", DEFAULT_POOL_SOLVER))
+    surrogate = build_surrogate(args, archive_x, archive_y)
+    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name == "nsga2" else {}
+    result = solve(
+        solver_name,
         problem=nsga_problem,
         archive_x=archive_x,
         archive_y=archive_y,
-        surrogate=build_surrogate(args, archive_x, archive_y),
-        pop_size=int(args.offspring_size) if bool(getattr(args, "offspring_size_user", False)) else None,
+        surrogate=surrogate,
+        pop_size=int(args.offspring_size) if bool(getattr(args, "offspring_size_user", False)) else len(archive_x),
         saea_steps=int(args.saea_steps),
         seed=int(args.seed) + int(step),
         seed_x=seed_x,
+        **solver_kwargs,
     )
+    metadata = {}
+    if solver_name == "moead_ego":
+        metadata = {
+            "candidate_weight_vectors": np.asarray(result.raw.weight_vectors, dtype=np.float32),
+            "eti": np.asarray(result.acquisition, dtype=np.float32),
+        }
     return (
         np.asarray(result.x, dtype=np.float32),
         np.asarray(result.mean, dtype=np.float32),
-        np.asarray(result.std, dtype=np.float32),
+        np.asarray(result.std if result.std is not None else surrogate.predict_std(result.x), dtype=np.float32),
         [np.arange(int(result.x.shape[0]), dtype=np.int64)],
-        {
-            "candidate_weight_vectors": np.asarray(result.weight_vectors, dtype=np.float32),
-            "eti": np.asarray(result.eti, dtype=np.float32),
-        },
+        metadata,
     )
+
+
+def resolve_rollout_solver(args, policy_key, infill_criterion):
+    if policy_key == "moead_ego" or isinstance(infill_criterion, TchebycheffProbabilityOfImprovement):
+        return "moead_ego"
+    return normalize_solver_name(getattr(args, "solver", DEFAULT_POOL_SOLVER))
 
 
 def refresh_offspring_predictions(
@@ -893,7 +860,7 @@ class StepRecord:
 
 
 def feasible_metrics(archive_y, archive_g, ref_point, true_pareto):
-    feasible = archive_y[(archive_g <= 0).all(axis=1)]
+    feasible = archive_y[feasible_mask(archive_g)]
     if not len(feasible):
         return feasible, 0.0, None
     front = pareto_front(feasible)
@@ -973,7 +940,7 @@ def run_policy_rollout_batched(
     compare_mode: bool = False,
     make_plot: bool = True,
     logger=print,
-    reward_scheme_id: int = 1,
+    reward: str = DEFAULT_REWARD,
     true_pareto_hv: float | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
     archive_x = np.asarray(archive_x_init, dtype=np.float32).copy()
@@ -983,6 +950,10 @@ def run_policy_rollout_batched(
     batch_size = max(1, int(getattr(args, "batch", 5)))
     fe_history = [int(args.init_fe)]
     archive_g = np.asarray(archive_g_init, dtype=np.float32).copy()
+    scale = initial_constraint_scale(archive_g)
+    reward_lambda = getattr(args, "reward_lambda", None)
+    if reward_lambda is None:
+        reward_lambda = resolve_default_reward_lambda(reward)
     front, hv, igd = feasible_metrics(archive_y, archive_g, ref_point, true_pareto)
     hv_history = [hv]
     igd_history = [igd]
@@ -1000,13 +971,13 @@ def run_policy_rollout_batched(
     step = 0
     pool_id = 0
     policy_key = str(policy_name).lower()
+    pool_solver = resolve_rollout_solver(args, policy_key, infill_criterion)
     codein = policy_key == "codein"
     if codein:
         if disc is None:
             raise ValueError("CodeIn rollout requires a built CodeIn agent.")
         if args.policy_mode not in {"q_greedy", "softmax_sample"}:
             raise ValueError("CodeIn inference supports q_greedy or softmax_sample.")
-        scale = initial_constraint_scale(archive_g)
         bounds = {
             "lower_bound": np.full(int(args.dim), float(problem.lower), dtype=np.float32),
             "upper_bound": np.full(int(args.dim), float(problem.upper), dtype=np.float32),
@@ -1014,6 +985,9 @@ def run_policy_rollout_batched(
     while step < n_evo_steps:
         pool_evals = min(batch_size, n_evo_steps - step)
         seed_x = None
+        constraint_gp = None
+        if archive_g.shape[1] and (codein or pool_solver == "nsga2"):
+            constraint_gp = build_surrogate(args, archive_x, archive_g)
         if codein:
             population_size = args.offspring_size if args.offspring_size_user else len(archive_x)
             seed_count = min(int(args.num_seeds), len(archive_x), int(population_size))
@@ -1046,10 +1020,11 @@ def run_policy_rollout_batched(
                 archive_y=archive_y,
                 step=pool_id,
                 seed_x=seed_x,
+                constraint_surrogate=constraint_gp,
+                solver_name=pool_solver,
             )
         if codein:
-            if archive_g.shape[1]:
-                constraint_gp = build_surrogate(args, archive_x, archive_g)
+            if constraint_gp is not None:
                 g_sur_mean = constraint_gp.predict_mean(offspring_x)
                 g_sur_std = constraint_gp.predict_std(offspring_x)
             else:
@@ -1141,23 +1116,25 @@ def run_policy_rollout_batched(
             else:
                 raise ValueError(f"Unsupported batched policy_name: {policy_name}")
 
-            previous_front = pareto_front(np.asarray(archive_y, dtype=np.float32))
             selected_x = offspring_x[selected_idx : selected_idx + 1]
             selected_pred = offspring_pred[selected_idx]
             selected_sigma = offspring_sigma[selected_idx]
             selected_true, selected_g = evaluate_objectives_and_constraints(problem, selected_x)
-            archive_g = np.vstack((archive_g, selected_g))
             if codein:
                 g_sur_mean = np.delete(g_sur_mean, selected_idx, axis=0)
                 g_sur_std = np.delete(g_sur_std, selected_idx, axis=0)
-            step_reward = compute_test_reward(
-                reward_scheme_id=int(reward_scheme_id),
-                previous_front=previous_front,
-                selected_objectives=selected_true,
+            step_reward = compute_env_reward(
+                previous_archive_y=archive_y,
+                previous_archive_g=archive_g,
+                selected_y=selected_true,
+                selected_g=selected_g,
+                constraint_scale=scale,
                 ref_point=ref_point,
-                reward_lambda=float(args.reward_lambda),
+                reward=reward,
+                reward_lambda=reward_lambda,
                 true_pareto_hv=true_pareto_hv,
             )
+            archive_g = np.vstack((archive_g, selected_g))
 
             archive_x = np.vstack([archive_x, selected_x]).astype(np.float32)
             archive_y = np.vstack([archive_y, selected_true]).astype(np.float32)
@@ -1230,9 +1207,9 @@ def run_policy_rollout_batched(
         "evolution_fe": n_evo_steps,
         "batch": batch_size,
         "surrogate_model": surrogate_model_name(args),
-        "candidate_solver": str(getattr(args, "solver", "moead_ego")).lower(),
-        "reward_lambda": float(args.reward_lambda),
-        "reward_scheme": int(reward_scheme_id),
+        "candidate_solver": pool_solver,
+        "reward_lambda": float(reward_lambda),
+        "reward": reward,
         "agent_name": args.agent_name,
         "policy_name": policy_key,
         "agent_pth": args.agent_pth,
@@ -1277,7 +1254,7 @@ def run_policy_rollout(
     compare_mode: bool = False,
     make_plot: bool = True,
     logger=print,
-    reward_scheme_id: int = 1,
+    reward: str = DEFAULT_REWARD,
     true_pareto_hv: float | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
     batch_size = max(1, int(getattr(args, "batch", 5)))
@@ -1298,7 +1275,7 @@ def run_policy_rollout(
             compare_mode=compare_mode,
             make_plot=make_plot,
             logger=logger,
-            reward_scheme_id=reward_scheme_id,
+            reward=reward,
             true_pareto_hv=true_pareto_hv,
         )
 
@@ -1308,6 +1285,10 @@ def run_policy_rollout(
     n_evo_steps = int(args.max_fe) - int(args.init_fe)
     fe_history = [int(args.init_fe)]
     archive_g = np.asarray(archive_g_init, dtype=np.float32).copy()
+    scale = initial_constraint_scale(archive_g)
+    reward_lambda = getattr(args, "reward_lambda", None)
+    if reward_lambda is None:
+        reward_lambda = resolve_default_reward_lambda(reward)
     front, hv, igd = feasible_metrics(archive_y, archive_g, ref_point, true_pareto)
     hv_history = [hv]
     igd_history = [igd]
@@ -1322,6 +1303,7 @@ def run_policy_rollout(
     prefix = format_policy_prefix(policy_name)
     logger(f"{prefix}iter 0 | FE = {fe_history[0]} | front = {len(front)} | HV = {hv:.12f} | IGD = {format_igd(igd)}")
 
+    pool_solver = resolve_rollout_solver(args, policy_key, infill_criterion)
     for step in range(n_evo_steps):
         policy_key = policy_name.lower()
         offspring_info: dict[str, Any] = {}
@@ -1341,12 +1323,17 @@ def run_policy_rollout(
                 "reference_vectors": None if moead_info is None else moead_info.get("reference_vectors")
             }
         else:
+            constraint_gp = None
+            if archive_g.shape[1] and pool_solver == "nsga2":
+                constraint_gp = build_surrogate(args, archive_x, archive_g)
             offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
                 args=args,
                 nsga_problem=nsga2_problem,
                 archive_x=archive_x,
                 archive_y=archive_y,
                 step=step,
+                constraint_surrogate=constraint_gp,
+                solver_name=pool_solver,
             )
         if policy_key == "disc_af":
             if disc is None:
@@ -1417,20 +1404,22 @@ def run_policy_rollout(
         else:
             raise ValueError(f"Unsupported policy_name: {policy_name}")
 
-        previous_front = pareto_front(np.asarray(archive_y, dtype=np.float32))
         selected_x = offspring_x[selected_idx : selected_idx + 1]
         selected_pred = offspring_pred[selected_idx]
         selected_sigma = offspring_sigma[selected_idx]
         selected_true, selected_g = evaluate_objectives_and_constraints(problem, selected_x)
-        archive_g = np.vstack((archive_g, selected_g))
-        step_reward = compute_test_reward(
-            reward_scheme_id=int(reward_scheme_id),
-            previous_front=previous_front,
-            selected_objectives=selected_true,
+        step_reward = compute_env_reward(
+            previous_archive_y=archive_y,
+            previous_archive_g=archive_g,
+            selected_y=selected_true,
+            selected_g=selected_g,
+            constraint_scale=scale,
             ref_point=ref_point,
-            reward_lambda=float(args.reward_lambda),
+            reward=reward,
+            reward_lambda=reward_lambda,
             true_pareto_hv=true_pareto_hv,
         )
+        archive_g = np.vstack((archive_g, selected_g))
 
         archive_x = np.vstack([archive_x, selected_x]).astype(np.float32)
         archive_y = np.vstack([archive_y, selected_true]).astype(np.float32)
@@ -1477,9 +1466,9 @@ def run_policy_rollout(
         "evolution_fe": n_evo_steps,
         "batch": int(getattr(args, "batch", 1)),
         "surrogate_model": surrogate_model_name(args),
-        "candidate_solver": str(getattr(args, "solver", "moead_ego")).lower(),
-        "reward_lambda": float(args.reward_lambda),
-        "reward_scheme": int(reward_scheme_id),
+        "candidate_solver": pool_solver,
+        "reward_lambda": float(reward_lambda),
+        "reward": reward,
         "agent_name": args.agent_name,
         "policy_name": policy_name.lower(),
         "agent_pth": args.agent_pth,
@@ -1538,7 +1527,7 @@ def run_policy_rollout_once(
     compare_mode: bool = False,
     logger=print,
     run_label: str | None = None,
-    reward_scheme_id: int = 1,
+    reward: str = DEFAULT_REWARD,
     true_pareto_hv: float | None = None,
     initial_archive: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[dict[str, Any], np.ndarray]:
@@ -1564,7 +1553,7 @@ def run_policy_rollout_once(
         compare_mode=compare_mode,
         make_plot=False,
         logger=logger,
-        reward_scheme_id=int(reward_scheme_id),
+        reward=reward,
         true_pareto_hv=true_pareto_hv,
     )
     summary = dict(summary)
@@ -1711,11 +1700,11 @@ def main(agent_name: str = "codein") -> None:
     infill_names = resolve_compare_infill_names(args)
     algo_names = resolve_compare_algo_names(args)
     problem = make_problem(args.problem, dim=args.dim)
-    true_pareto = reference_front(args.problem)
+    true_pareto = reference_front(args.problem, args.dim)
     adapter = make_nsga2_problem_adapter(problem, problem.n_obj)
-    reward_scheme_id = resolve_test_reward_scheme(args)
+    reward = args.reward
     if args.reward_lambda is None:
-        args.reward_lambda = resolve_default_reward_lambda(reward_scheme_id)
+        args.reward_lambda = resolve_default_reward_lambda(reward)
 
     set_seed(seeds[0])
     primary_agent = build_agent(args, map_location=args.device, agent_name=primary)[0] if is_agent_policy(primary) else None
@@ -1744,7 +1733,7 @@ def main(agent_name: str = "codein") -> None:
         try:
             initial_archive = build_initial_archive(args=args, problem=problem, seed=seed)
             ref_point = get_reference_point(initial_archive[1])
-            true_hv = hypervolume(true_pareto, ref_point) if reward_scheme_id == 2 else None
+            true_hv = hypervolume(true_pareto, ref_point) if reward == "hv" else None
             log(f"test | problem = {args.problem} | dim = {args.dim} | seed = {seed} | solver = {args.solver}")
             log(f"reference_point = {ref_point.tolist()}")
             seed_result = {
@@ -1760,7 +1749,7 @@ def main(agent_name: str = "codein") -> None:
                 result, _ = run_policy_rollout_once(
                     args=case_args, problem=problem, nsga2_problem=adapter, ref_point=ref_point,
                     true_pareto=true_pareto, policy_name=name, disc=model, infill_criterion=criterion,
-                    compare_mode=len(cases) > 1, logger=log, run_label=label, reward_scheme_id=reward_scheme_id,
+                    compare_mode=len(cases) > 1, logger=log, run_label=label, reward=reward,
                     true_pareto_hv=true_hv, initial_archive=initial_archive,
                 )
                 histories[group, name].append(result)
@@ -1769,7 +1758,8 @@ def main(agent_name: str = "codein") -> None:
                 else:
                     key = "infill_results" if group == "infill" else "baseline_results"
                     seed_result[key][name] = result
-                log(f"{label} | final HV = {result['final_hv']:.12f} | final IGD = {format_igd(result['final_igd'])}")
+                log(f"{label} | solver = {result['candidate_solver']} | final HV = {result['final_hv']:.12f} | "
+                    f"final IGD = {format_igd(result['final_igd'])}")
             per_seed.append(seed_result)
         finally:
             log_fp.close()
@@ -1783,7 +1773,7 @@ def main(agent_name: str = "codein") -> None:
     primary_metrics = aggregate["primary", primary]
     summary = {
         "problem": args.problem, "dim": args.dim, "seeds": seeds,
-        "agent_name": args.agent_name, "primary_policy": primary, "reward_scheme": reward_scheme_id,
+        "agent_name": args.agent_name, "primary_policy": primary, "reward": reward,
         "compare_infill_resolved": infill_names, "compare_algo_resolved": algo_names,
         "reference_front": true_pareto.tolist(),
         "primary": primary_metrics,

@@ -9,7 +9,7 @@ from scipy.spatial.distance import cdist
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF
 
-from surrogate.surrogate_model import SurrogateModel
+from surrogate.surrogate import SurrogateModel
 
 
 def safe_divide(numerator: np.ndarray, denominator: np.ndarray, eps: float = 1e-12) -> np.ndarray:
