@@ -16,7 +16,7 @@ class SolverRequest:
     surrogate: Any | None = None
     gps: Any | None = None
     pop_size: int = 80
-    saea_steps: int = 25
+    saea_steps: int = 15
     seed: int = 0
     n_mc: int = 128
     extra: dict[str, Any] = field(default_factory=dict)
@@ -36,7 +36,7 @@ class SolverResult:
 
 SolverFn = Callable[[SolverRequest], SolverResult]
 DEFAULT_POOL_SOLVER = "nsga2"
-POOL_SOLVERS = (DEFAULT_POOL_SOLVER, "moead_ego")
+POOL_SOLVERS = (DEFAULT_POOL_SOLVER, "nsga3", "moead_ego")
 
 
 def _surrogate_predict_mean(surrogate, x: np.ndarray) -> np.ndarray:
@@ -92,6 +92,7 @@ def normalize_solver_name(name: str) -> str:
         "nsga_ii": "nsga2",
         "nsga_2": "nsga2",
         "nsga_3": "nsga3",
+        "nsga_iii": "nsga3",
         "moead_ego_solver": "moead_ego",
     }
     return aliases.get(normalized, normalized)
@@ -120,7 +121,7 @@ def solve(
     surrogate=None,
     gps=None,
     pop_size: int = 80,
-    saea_steps: int = 25,
+    saea_steps: int = 15,
     seed: int = 0,
     n_mc: int = 128,
     surrogate_nsga_steps: int | None = None,

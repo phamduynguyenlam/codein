@@ -45,7 +45,7 @@ def run_surrogate_nsga2(
     pop_size,
     gps=None,
     surrogate=None,
-    saea_steps=25,
+    saea_steps=15,
     seed=0,
     *,
     constraint_surrogate=None,

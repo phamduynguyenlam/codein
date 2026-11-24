@@ -19,7 +19,7 @@ Optional for CLI examples:
 
 Example:
     python moead_ego.py --problem MW1 --n-var 15 --seed 0 \
-        --init-samples 100 --infill-budget 200 --moead-pop 200 --saea_steps 30
+        --init-samples 100 --infill-budget 200 --moead-pop 200 --saea_steps 15
 """
 
 from __future__ import annotations
@@ -210,7 +210,7 @@ class MOEADEGOConfig:
     infill_budget: int = 200
     batch_size: int = 5
     moead_pop: int = 200
-    saea_steps: int = 30
+    saea_steps: int = 15
     neighbor_frac: float = 0.1
     delta: float = 0.9
     nr: int = 2
@@ -509,7 +509,7 @@ def propose_moead_ego_candidates(
     archive_x: Array,
     archive_y: Array,
     pop_size: int | None = None,
-    saea_steps: int = 30,
+    saea_steps: int = 15,
     batch_size: int = 1,
     gp_restarts: int = 3,
     seed: int = 0,
@@ -665,7 +665,7 @@ def main() -> None:
     parser.add_argument("--infill-budget", type=int, default=MOEADEGOConfig.infill_budget)
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--moead-pop", type=int, default=200)
-    parser.add_argument("--saea_steps", type=int, default=30)
+    parser.add_argument("--saea_steps", type=int, default=15)
     parser.add_argument("--gp-restarts", type=int, default=3)
     parser.add_argument("--save", type=str, default="")
     parser.add_argument("--output_json", type=str, default=None)

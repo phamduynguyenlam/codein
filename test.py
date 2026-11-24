@@ -310,8 +310,8 @@ def canonical_solver_family_name(name: str | None) -> str | None:
     if name is None:
         return None
     key = str(name).strip().lower().replace("-", "_").replace("/", "_")
-    if normalize_solver_name(key) == "nsga2":
-        return "nsga2"
+    if normalize_solver_name(key) in {"nsga2", "nsga3"}:
+        return normalize_solver_name(key)
     if key in {"moead_ego", "moea_d_ego"}:
         return "moead_ego"
     return None
@@ -482,7 +482,7 @@ def parse_args() -> argparse.Namespace:
     args.reward_lambda = None
     args.problem = str(args.problem).upper()
     args.offspring_size_user = args.offspring_size is not None
-    args.saea_steps = 50
+    args.saea_steps = 15
     if not args.offspring_size_user:
         args.offspring_size = 150
     if is_random_agent_path(args.compare_agent_pth):
@@ -591,7 +591,7 @@ def generate_offspring_pool(
     if solver_name is None:
         solver_name = normalize_solver_name(getattr(args, "solver", DEFAULT_POOL_SOLVER))
     surrogate = build_surrogate(args, archive_x, archive_y)
-    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name == "nsga2" else {}
+    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name in {"nsga2", "nsga3"} else {}
     result = solve(
         solver_name,
         problem=nsga_problem,
@@ -986,7 +986,7 @@ def run_policy_rollout_batched(
         pool_evals = min(batch_size, n_evo_steps - step)
         seed_x = None
         constraint_gp = None
-        if archive_g.shape[1] and (codein or pool_solver == "nsga2"):
+        if archive_g.shape[1] and (codein or pool_solver in {"nsga2", "nsga3"}):
             constraint_gp = build_surrogate(args, archive_x, archive_g)
         if codein:
             population_size = args.offspring_size if args.offspring_size_user else len(archive_x)
@@ -1324,7 +1324,7 @@ def run_policy_rollout(
             }
         else:
             constraint_gp = None
-            if archive_g.shape[1] and pool_solver == "nsga2":
+            if archive_g.shape[1] and pool_solver in {"nsga2", "nsga3"}:
                 constraint_gp = build_surrogate(args, archive_x, archive_g)
             offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
                 args=args,

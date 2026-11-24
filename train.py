@@ -20,6 +20,7 @@ from agents.codein import DiscAF, CodeIn, tensor_policy_state
 from solver.solver import DEFAULT_POOL_SOLVER, POOL_SOLVERS, normalize_solver_name, solve
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
 from problem.problem import DAS_PROBLEMS, DEFAULT_TRAIN_DIM, MW_PROBLEMS, get_reference_point, make_problem, reference_front
+from scipy.spatial import cKDTree
 from lhs import latin_hypercube_sample as _scipy_latin_hypercube_sample
 from reward import (
     hypervolume,
@@ -387,7 +388,7 @@ def generate_offspring_pool(cfg_dict, archive_x, archive_y, nsga2_problem, seed,
         surrogate_name="gp",
     )
     solver_name = normalize_solver_name(cfg_dict.get("solver", DEFAULT_POOL_SOLVER))
-    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name == "nsga2" else {}
+    solver_kwargs = {"constraint_surrogate": constraint_surrogate} if solver_name in {"nsga2", "nsga3"} else {}
     result = solve(
         solver_name,
         problem=nsga2_problem,
@@ -935,7 +936,7 @@ class DiscSAEAEnv:
             seed_x = self.archive_x[indices[0].cpu().numpy()]
         constraint_surrogate = None
         solver_name = normalize_solver_name(self.cfg.get("solver", DEFAULT_POOL_SOLVER))
-        if self.archive_g.shape[1] and (self.init_policy is not None or solver_name == "nsga2"):
+        if self.archive_g.shape[1] and (self.init_policy is not None or solver_name in {"nsga2", "nsga3"}):
             constraint_surrogate = build_surrogate_from_cfg(self._surrogate_cfg(), self.archive_x, self.archive_g)
         surrogate, offspring_x, offspring_y, offspring_sigma, offspring_info = generate_offspring_pool(
             self._surrogate_cfg(),
@@ -1224,6 +1225,10 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     elif bool(cfg_dict.get("reward_norm", False)):
         transitions = _normalize_episode_transition_rewards(transitions)
 
+    feasible_y = env.archive_y[feasible_mask(env.archive_g)]
+    final_igd = None
+    if len(feasible_y):
+        final_igd = float(cKDTree(feasible_y).query(reference_front(problem_name, dim))[0].mean())
     task_finished_at = time.perf_counter()
     return {
         "transitions": transitions,
@@ -1235,6 +1240,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
         "env_key": env_key(problem_name, dim),
         "init_hv": init_hv,
         "final_hv": float(env.current_hv()),
+        "final_igd": final_igd,
         **_rollout_storage_metrics(transitions),
         "worker_pid": int(worker_pid),
         "disc_steps": int(disc_steps),
@@ -1637,6 +1643,7 @@ def train_codein(
                     "reward_per_fe": [],
                     "init_hv": [],
                     "final_hv": [],
+                    "final_igd": [],
                 },
             )
             ep_reward = float(result.get("logging_reward", result["episode_reward"]))
@@ -1645,6 +1652,8 @@ def train_codein(
             bucket["reward_per_fe"].append(ep_reward / float(ep_steps))
             bucket["init_hv"].append(float(result["init_hv"]))
             bucket["final_hv"].append(float(result["final_hv"]))
+            if result["final_igd"] is not None:
+                bucket["final_igd"].append(result["final_igd"])
         per_env_summaries = {}
         for key, stats in sorted(per_env_stats.items()):
             if len(stats["rewards"]) == 0:
@@ -1655,6 +1664,9 @@ def train_codein(
                 "init_hv": float(np.mean(stats["init_hv"])),
                 "final_hv": float(np.mean(stats["final_hv"])),
             }
+            igd_values = stats["final_igd"]
+            igd_text = f"{np.mean(igd_values):.12f}" if igd_values else "NA"
+            log(f"epoch {epoch}/{logged_epoch_target} | {key} | final IGD = {igd_text} | valid = {len(igd_values)}/{len(stats['rewards'])}")
         reward_metric_name = "mean reward/FE"
         mean_ep_reward = float(np.mean([
             value["mean_reward_per_fe"] for value in per_env_summaries.values()

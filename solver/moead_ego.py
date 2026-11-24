@@ -249,7 +249,7 @@ def run_surrogate_moead_ego(
     archive_y: np.ndarray,
     surrogate: Any,
     pop_size: int | None = None,
-    saea_steps: int = 30,
+    saea_steps: int = 15,
     seed: int = 0,
     neighbor_frac: float = 0.1,
     delta: float = 0.9,

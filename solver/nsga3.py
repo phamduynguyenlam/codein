@@ -9,8 +9,10 @@ from pymoo.optimize import minimize
 from pymoo.termination import get_termination
 from pymoo.util.ref_dirs import get_reference_directions
 
-from solver.solver import GPSurrogateProblem, _ModelListSurrogate
+from solver.solver import _ModelListSurrogate
 from solver.population_utils import sample_unique_non_parent, unique_non_parent_indices
+from solver.nsga2 import _SurrogateProblem
+from lhs import latin_hypercube_sample
 
 
 @dataclass(frozen=True)
@@ -106,42 +108,55 @@ def run_surrogate_nsga3(
     pop_size,
     gps=None,
     surrogate=None,
-    saea_steps=25,
+    saea_steps=15,
     seed=0,
     n_gen=None,
     surrogate_nsga_steps=None,
+    seed_x=None,
+    constraint_surrogate=None,
 ):
     requested_pop_size = int(pop_size)
     if surrogate_nsga_steps is not None:
         saea_steps = surrogate_nsga_steps
     if n_gen is not None:
         saea_steps = n_gen
+    if requested_pop_size < 2 or int(saea_steps) < 1:
+        raise ValueError("NSGA-III requires pop_size >= 2 and saea_steps >= 1.")
     if surrogate is None:
         if gps is None:
             raise ValueError("run_surrogate_nsga3 requires either `surrogate` or `gps`.")
         surrogate = _ModelListSurrogate(gps)
 
-    surrogate_problem = GPSurrogateProblem(
+    initial = np.asarray(archive_x if seed_x is None else seed_x, dtype=np.float64)
+    if initial.ndim != 2 or initial.shape[1] != problem.n_var:
+        raise ValueError("Initial seeds must have shape [K, n_var].")
+    initial = initial[unique_non_parent_indices(initial, initial[:0])]
+    rng = np.random.default_rng(seed)
+    if len(initial) > requested_pop_size:
+        initial = initial[rng.choice(len(initial), requested_pop_size, replace=False)]
+    if len(initial) < requested_pop_size:
+        unit = latin_hypercube_sample(
+            n_samples=requested_pop_size - len(initial), dim=problem.n_var,
+            lower=0.0, upper=1.0, seed=int(seed),
+        )
+        lower, upper = np.asarray(problem.xl), np.asarray(problem.xu)
+        initial = np.vstack((initial, lower + unit * (upper - lower)))
+    n_constraints = 0 if constraint_surrogate is None else constraint_surrogate.predict_mean(initial[:1]).shape[1]
+    surrogate_problem = _SurrogateProblem(
         surrogate=surrogate,
+        constraint_surrogate=constraint_surrogate,
+        n_ieq_constr=n_constraints,
         n_var=problem.n_var,
         n_obj=problem.n_obj,
         xl=problem.xl,
         xu=problem.xu,
     )
 
-    init_x = np.asarray(archive_x, dtype=np.float64)
-    if init_x.shape[0] >= requested_pop_size:
-        init_x = init_x[:requested_pop_size].copy()
-    else:
-        rng = np.random.default_rng(seed)
-        idx = rng.integers(0, init_x.shape[0], size=requested_pop_size)
-        init_x = init_x[idx].copy()
-
     ref_dirs = _build_reference_directions(int(problem.n_obj), requested_pop_size, int(seed))
     algorithm = NSGA3(
         pop_size=requested_pop_size,
         ref_dirs=ref_dirs,
-        sampling=init_x,
+        sampling=initial,
         eliminate_duplicates=True,
     )
 
@@ -154,8 +169,8 @@ def run_surrogate_nsga3(
         save_history=False,
     )
 
-    candidate_x = np.asarray(res.X, dtype=np.float64)
-    candidate_y = np.asarray(res.F, dtype=np.float64)
+    candidate_x = np.asarray(res.pop.get("X"), dtype=np.float64)
+    candidate_y = np.asarray(res.pop.get("F"), dtype=np.float64)
     if candidate_x.ndim == 1:
         candidate_x = candidate_x.reshape(1, -1)
     if candidate_y.ndim == 1:
