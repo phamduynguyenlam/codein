@@ -46,12 +46,20 @@ class CodeIn(BaseAgent):
     """Neural Hierarchical Infill Sampling with seed grading and infill Q-values."""
 
     def __init__(self, hidden_dim=128, n_heads=8, ff_dim=256, dropout=0.0):
-        super().__init__(hidden_dim, n_heads, ff_dim, dropout)
+        super().__init__(
+            hidden_dim, n_heads, ff_dim, dropout,
+            use_cross_space_attention=False,
+        )
         self.archive_attention = TsAttnBlock(hidden_dim, n_heads, ff_dim, dropout)
         self.offspring_attention = TsAttnBlock(hidden_dim, n_heads, ff_dim, dropout)
         self.constraint_encoder = _ConstraintEncoder(hidden_dim, dropout, input_dim=3)
         self.archive_fusion = self._fusion_mlp(hidden_dim)
         self.offspring_fusion = self._fusion_mlp(hidden_dim)
+        self.infill_fusion = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.init_head = nn.Sequential(
             nn.Linear(2 * hidden_dim + 2, hidden_dim),
             nn.GELU(),
@@ -167,7 +175,7 @@ class CodeIn(BaseAgent):
     def forward(self, x_true, y_true, x_sur, y_sur, sigma_sur, progress, lower_bound, upper_bound,
                 seed_count, archive_mask=None, candidate_mask=None, g_true=None, g_sur_mean=None,
                 g_sur_std=None, constraint_scale=None, constraint_mask=None):
-        h_a, _, budget_features, archive_mask = self.encode_archive(
+        _, h_A, budget_features, archive_mask = self.encode_archive(
             x_true, y_true, progress, lower_bound, upper_bound, seed_count,
             g_true=g_true, constraint_scale=constraint_scale, archive_mask=archive_mask,
             constraint_mask=constraint_mask,
@@ -186,9 +194,8 @@ class CodeIn(BaseAgent):
             std=g_sur_std, constraint_mask=constraint_mask,
         )
         offspring = self.offspring_fusion(torch.cat((objectives, constraints), dim=-1))
-        if h_a.size(1) and offspring.size(1):
-            attended = self.cross_space_attn(offspring, h_a, h_a, key_padding_mask=~_attention_mask(archive_mask))
-            offspring = torch.where(archive_mask.any(dim=1).view(-1, 1, 1), attended, offspring)
+        archive_context = h_A.unsqueeze(1).expand(-1, offspring.size(1), -1)
+        offspring = self.infill_fusion(torch.cat((offspring, archive_context), dim=-1))
         offspring = offspring.masked_fill(~candidate_mask.unsqueeze(-1), 0.0)
         q = self.q_decoder(
             offspring, budget_features.unsqueeze(1).expand(-1, offspring.size(1), -1),

@@ -1,6 +1,6 @@
-# CodeIn
+# CoDeIn: Constrained Deep Infill Sampling in Expensive CMOPs
 
-CodeIn learns to grade archive points as seeds for constrained NSGA-II and select offspring for black-box evaluation.
+CoDeIn learns to grade archive points as seeds for constrained NSGA-II and select offspring for black-box evaluation. Each offspring embedding is concatenated with the masked mean archive embedding and passed through a shared MLP before the dueling Q decoder. This architecture requires newly trained checkpoints.
 
 ## Setup
 
