@@ -4,7 +4,8 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -317,7 +318,10 @@ def run_eic_mssaea(cfg, logger=print, initial_archive=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="EIC-MSSAEA using the repository GP and NSGA-III solver.")
-    parser.add_argument("--problem", type=normalize_problem_name, choices=SUPPORTED_PROBLEMS, default="DAS-CMOP4")
+    problems = parser.add_mutually_exclusive_group()
+    problems.add_argument("--problem", type=normalize_problem_name, choices=SUPPORTED_PROBLEMS, default="DAS-CMOP4")
+    problems.add_argument("--problems", type=normalize_problem_name, choices=SUPPORTED_PROBLEMS, nargs="+")
+    parser.add_argument("--plot", action="store_true", help="Keep each run's plot open while subsequent runs execute.")
     parser.add_argument("--dim", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init_fe", type=int, default=None, help="Defaults to 11*dim-1.")
@@ -331,13 +335,14 @@ def parse_args():
     parser.add_argument("--output_json", type=Path)
     parser.add_argument("--log_path", type=Path)
     args = parser.parse_args()
+    if args.problems:
+        args.problem = args.problems[0]
     config = EICConfig(**{name: getattr(args, name) for name in EICConfig.__dataclass_fields__})
     config.validate()
     return args, config
 
 
-def main():
-    args, cfg = parse_args()
+def save_run(args, cfg):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = args.log_path or ROOT_DIR / "testing_logs" / cfg.problem / f"eic_mssaea_{cfg.problem.lower()}_seed{cfg.seed}_{stamp}.txt"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -350,7 +355,67 @@ def main():
     output = args.output_json or log_path.with_suffix(".json")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
-    print(f"Results saved to {output.resolve()}")
+    print(f"Results saved to {output.resolve()}", flush=True)
+    return summary, output
+
+
+def plot_run(summary, output):
+    import matplotlib.pyplot as plt
+
+    cfg = summary["config"]
+    reference = np.asarray(summary["reference_front"])
+    front = np.asarray(summary["final_front"]).reshape(-1, reference.shape[1])
+    fig = plt.figure(figsize=(16, 5))
+    fig.suptitle(f"EIC-MSSAEA | {cfg['problem']} | {cfg['dim']}D | seed {cfg['seed']}")
+    hv_axis, igd_axis = fig.add_subplot(131), fig.add_subplot(132)
+    for axis, metric, label in ((hv_axis, "hv", "HV"), (igd_axis, "igd", "IGD")):
+        values = np.asarray(summary[f"{metric}_history"], dtype=float)
+        axis.plot(summary["fe_history"], values)
+        axis.set(xlabel="FE", ylabel=label, title=label)
+        axis.grid(alpha=.3)
+    projection = "3d" if reference.shape[1] == 3 else None
+    front_axis = fig.add_subplot(133, projection=projection)
+    front_axis.scatter(*reference.T, s=3, color="grey", alpha=.4, label="Reference front")
+    if len(front):
+        front_axis.scatter(*front.T, s=15, label="EIC-MSSAEA")
+    front_axis.set(xlabel="F1", ylabel="F2", title="Feasible front")
+    if projection:
+        front_axis.set_zlabel("F3")
+    front_axis.legend()
+    fig.tight_layout()
+    fig.savefig(output.with_suffix(".png"), dpi=180)
+    plt.show(block=False)
+    plt.pause(.1)
+    return fig
+
+
+def main():
+    args, cfg = parse_args()
+    problem_names = args.problems or [cfg.problem]
+    if args.plot:
+        import matplotlib.pyplot as plt
+
+    # A single worker keeps computation sequential and the GUI event loop responsive.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        for name in problem_names:
+            run_args = argparse.Namespace(**vars(args))
+            if len(problem_names) > 1:
+                for field in ("output_json", "log_path"):
+                    path = getattr(run_args, field)
+                    if path is not None:
+                        setattr(run_args, field, path.with_name(f"{path.stem}_{name.lower()}{path.suffix}"))
+            future = executor.submit(save_run, run_args, replace(cfg, problem=name))
+            if args.plot:
+                while not future.done():
+                    if plt.get_fignums():
+                        plt.pause(.1)
+                    else:
+                        time.sleep(.1)
+            summary, output = future.result()
+            if args.plot:
+                plot_run(summary, output)
+    if args.plot and plt.get_fignums():
+        plt.show()
 
 
 if __name__ == "__main__":
