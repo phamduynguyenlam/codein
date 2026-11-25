@@ -1040,8 +1040,6 @@ class DiscSAEAEnv:
             if normalize_reward(self.cfg.get("reward", DEFAULT_REWARD)) == "hv" else None
         )
         self.nsga2_problem = make_nsga2_problem_adapter(self.problem, int(self.archive_y.shape[1]))
-        # Pretrain the surrogate on the initial archive, then generate the first pool.
-        self._fit_surrogate()
         self._refresh_offspring()
         return self._build_state()
 
@@ -1549,137 +1547,242 @@ def train_codein(
     )
     log(training_config_message)
     replay = ReplayBuffer(cfg.replay_size)
-    for it in range(cfg.train_iters):
-        epoch = int(it) + 1
-        epoch_solver = cfg.solver
-        epsilon = epsilon_by_iter(it, cfg)
-        if not codein:
-            replay = ReplayBuffer(cfg.replay_size)
-        epoch_cfg_dict = cfg_dict.copy()
-        epoch_cfg_dict["solver"] = str(epoch_solver)
+    try:
+        for it in range(cfg.train_iters):
+            epoch = int(it) + 1
+            epoch_solver = cfg.solver
+            epsilon = epsilon_by_iter(it, cfg)
+            if not codein:
+                replay = ReplayBuffer(cfg.replay_size)
+            epoch_cfg_dict = cfg_dict.copy()
+            epoch_cfg_dict["solver"] = str(epoch_solver)
 
-        exploration = f"temperature = {cfg.temperature:g}" if codein else f"epsilon = {epsilon:.3f}"
-        log(
-            f"epoch {epoch}/{logged_epoch_target} | start | "
-            f"solver = {epoch_solver} | {exploration}"
-        )
-        state_cpu = clone_state_dict_cpu(agent)
-        pre_update_state_dict = copy.deepcopy(agent.state_dict())
-        if not bool(use_ray) and executor is None:
-            executor = ProcessPoolExecutor(max_workers=actual_num_workers)
-        futures = []
-        for env_idx, spec in enumerate(env_specs):
-            for ep in range(int(cfg.episodes_per_worker)):
-                seed = int(cfg.seed) + 100000 * epoch + 1000 * env_idx + ep
-                if bool(use_ray):
-                    futures.append(
-                        ray_rollout_remote.remote(
-                            state_dict_cpu=state_cpu,
-                            cfg_dict=epoch_cfg_dict,
-                            problem_name=spec["problem_name"],
-                            dim=int(spec["dim"]),
-                            seed=int(seed),
-                            epsilon=epsilon,
-                        )
-                    )
-                else:
-                    futures.append(
-                        executor.submit(
-                            rollout_episode_task_local,
-                            state_cpu,
-                            epoch_cfg_dict,
-                            spec["problem_name"],
-                            int(spec["dim"]),
-                            int(seed),
-                            epsilon,
-                        )
-                    )
-        if len(futures) == 0:
-            raise ValueError("No rollout tasks were created.")
-        if bool(use_ray):
-            results = ray_mod.get(futures)
-        else:
-            results = []
-            for future in futures:
-                results.append(future.result())
-            executor.shutdown(wait=True)
-            executor = None
-        parallel_stats = summarize_parallel_rollout(results)
-        if parallel_stats is not None:
+            exploration = f"temperature = {cfg.temperature:g}" if codein else f"epsilon = {epsilon:.3f}"
             log(
-                f"[Epoch {epoch:04d}] interact parallel | "
-                f"tasks={parallel_stats['tasks']} | "
-                f"unique_pids={parallel_stats['unique_pids']} | "
-                f"pid_list={parallel_stats['pid_list']} | "
-                f"overlap_wall_sec={parallel_stats['overlap_wall_sec']:.3f} | "
-                f"sum_task_sec={parallel_stats['sum_task_sec']:.3f} | "
-                f"mean_task_sec={parallel_stats['mean_task_sec']:.3f} | "
-                f"min_task_sec={parallel_stats['min_task_sec']:.3f} | "
-                f"max_task_sec={parallel_stats['max_task_sec']:.3f} | "
-                f"parallelism_est={parallel_stats['parallelism_est']:.2f}"
+                f"epoch {epoch}/{logged_epoch_target} | start | "
+                f"solver = {epoch_solver} | {exploration}"
             )
+            state_cpu = clone_state_dict_cpu(agent)
+            pre_update_state_dict = copy.deepcopy(agent.state_dict())
+            if not bool(use_ray) and executor is None:
+                executor = ProcessPoolExecutor(max_workers=actual_num_workers)
+            futures = []
+            for env_idx, spec in enumerate(env_specs):
+                for ep in range(int(cfg.episodes_per_worker)):
+                    seed = int(cfg.seed) + 100000 * epoch + 1000 * env_idx + ep
+                    if bool(use_ray):
+                        futures.append(
+                            ray_rollout_remote.remote(
+                                state_dict_cpu=state_cpu,
+                                cfg_dict=epoch_cfg_dict,
+                                problem_name=spec["problem_name"],
+                                dim=int(spec["dim"]),
+                                seed=int(seed),
+                                epsilon=epsilon,
+                            )
+                        )
+                    else:
+                        futures.append(
+                            executor.submit(
+                                rollout_episode_task_local,
+                                state_cpu,
+                                epoch_cfg_dict,
+                                spec["problem_name"],
+                                int(spec["dim"]),
+                                int(seed),
+                                epsilon,
+                            )
+                        )
+            if len(futures) == 0:
+                raise ValueError("No rollout tasks were created.")
+            if bool(use_ray):
+                results = ray_mod.get(futures)
+            else:
+                results = []
+                for future in futures:
+                    results.append(future.result())
+            parallel_stats = summarize_parallel_rollout(results)
+            if parallel_stats is not None:
+                log(
+                    f"[Epoch {epoch:04d}] interact parallel | "
+                    f"tasks={parallel_stats['tasks']} | "
+                    f"unique_pids={parallel_stats['unique_pids']} | "
+                    f"pid_list={parallel_stats['pid_list']} | "
+                    f"overlap_wall_sec={parallel_stats['overlap_wall_sec']:.3f} | "
+                    f"sum_task_sec={parallel_stats['sum_task_sec']:.3f} | "
+                    f"mean_task_sec={parallel_stats['mean_task_sec']:.3f} | "
+                    f"min_task_sec={parallel_stats['min_task_sec']:.3f} | "
+                    f"max_task_sec={parallel_stats['max_task_sec']:.3f} | "
+                    f"parallelism_est={parallel_stats['parallelism_est']:.2f}"
+                )
 
-        per_env_stats = {}
-        replay_payload_bytes = 0
-        replay_transition_bytes_mean = []
-        replay_transition_bytes_max = []
-        replay_archive_rows_mean = []
-        replay_archive_rows_max = []
-        replay_candidate_rows_mean = []
-        replay_candidate_rows_max = []
-        for result in results:
-            replay.extend(result["transitions"])
-            replay_payload_bytes += int(result.get("transition_bytes_total", 0))
-            replay_transition_bytes_mean.append(float(result.get("transition_bytes_mean", 0.0)))
-            replay_transition_bytes_max.append(int(result.get("transition_bytes_max", 0)))
-            replay_archive_rows_mean.append(float(result.get("archive_rows_mean", 0.0)))
-            replay_archive_rows_max.append(int(result.get("archive_rows_max", 0)))
-            replay_candidate_rows_mean.append(float(result.get("candidate_rows_mean", 0.0)))
-            replay_candidate_rows_max.append(int(result.get("candidate_rows_max", 0)))
-            bucket = per_env_stats.setdefault(
-                result["env_key"],
-                {
-                    "rewards": [],
-                    "reward_per_fe": [],
-                    "init_hv": [],
-                    "final_hv": [],
-                    "final_igd": [],
-                },
-            )
-            ep_reward = float(result.get("logging_reward", result["episode_reward"]))
-            ep_steps = max(int(result.get("logging_steps", result.get("episode_steps", 0))), 1)
-            bucket["rewards"].append(ep_reward)
-            bucket["reward_per_fe"].append(ep_reward / float(ep_steps))
-            bucket["init_hv"].append(float(result["init_hv"]))
-            bucket["final_hv"].append(float(result["final_hv"]))
-            if result["final_igd"] is not None:
-                bucket["final_igd"].append(result["final_igd"])
-        per_env_summaries = {}
-        for key, stats in sorted(per_env_stats.items()):
-            if len(stats["rewards"]) == 0:
+            per_env_stats = {}
+            replay_payload_bytes = 0
+            replay_transition_bytes_mean = []
+            replay_transition_bytes_max = []
+            replay_archive_rows_mean = []
+            replay_archive_rows_max = []
+            replay_candidate_rows_mean = []
+            replay_candidate_rows_max = []
+            for result in results:
+                replay.extend(result["transitions"])
+                replay_payload_bytes += int(result.get("transition_bytes_total", 0))
+                replay_transition_bytes_mean.append(float(result.get("transition_bytes_mean", 0.0)))
+                replay_transition_bytes_max.append(int(result.get("transition_bytes_max", 0)))
+                replay_archive_rows_mean.append(float(result.get("archive_rows_mean", 0.0)))
+                replay_archive_rows_max.append(int(result.get("archive_rows_max", 0)))
+                replay_candidate_rows_mean.append(float(result.get("candidate_rows_mean", 0.0)))
+                replay_candidate_rows_max.append(int(result.get("candidate_rows_max", 0)))
+                bucket = per_env_stats.setdefault(
+                    result["env_key"],
+                    {
+                        "rewards": [],
+                        "reward_per_fe": [],
+                        "init_hv": [],
+                        "final_hv": [],
+                        "final_igd": [],
+                    },
+                )
+                ep_reward = float(result.get("logging_reward", result["episode_reward"]))
+                ep_steps = max(int(result.get("logging_steps", result.get("episode_steps", 0))), 1)
+                bucket["rewards"].append(ep_reward)
+                bucket["reward_per_fe"].append(ep_reward / float(ep_steps))
+                bucket["init_hv"].append(float(result["init_hv"]))
+                bucket["final_hv"].append(float(result["final_hv"]))
+                if result["final_igd"] is not None:
+                    bucket["final_igd"].append(result["final_igd"])
+            per_env_summaries = {}
+            for key, stats in sorted(per_env_stats.items()):
+                if len(stats["rewards"]) == 0:
+                    continue
+                per_env_summaries[key] = {
+                    "mean_reward": float(np.mean(stats["rewards"])),
+                    "mean_reward_per_fe": float(np.mean(stats["reward_per_fe"])),
+                    "init_hv": float(np.mean(stats["init_hv"])),
+                    "final_hv": float(np.mean(stats["final_hv"])),
+                }
+                igd_values = stats["final_igd"]
+                igd_text = f"{np.mean(igd_values):.12f}" if igd_values else "NA"
+                log(f"epoch {epoch}/{logged_epoch_target} | {key} | final IGD = {igd_text} | valid = {len(igd_values)}/{len(stats['rewards'])}")
+            reward_metric_name = "mean reward/FE"
+            mean_ep_reward = float(np.mean([
+                value["mean_reward_per_fe"] for value in per_env_summaries.values()
+            ])) if per_env_summaries else 0.0
+            if bool(getattr(cfg, "cuda_cleanup_before_update", False)):
+                _cleanup_cuda_cache(cfg.device, rounds=3, sleep_sec=1.0)
+            update_start_time = time.perf_counter()
+
+            if len(replay) < cfg.batch_size and not codein:
+                log(
+                    f"epoch {epoch}/{logged_epoch_target} | reward/FE = {mean_ep_reward:.4f} | "
+                    f"replay = {len(replay)} | update = skipped"
+                )
+                if mean_ep_reward > best_reward:
+                    log(f"new best {reward_metric_name} at epoch {epoch}: {mean_ep_reward:.4f}")
+                best_reward = save_training_checkpoint(
+                    agent,
+                    cfg,
+                    cfg.heldout_problem,
+                    epoch,
+                    mean_ep_reward,
+                    best_reward,
+                    best_state_dict=pre_update_state_dict,
+                )
                 continue
-            per_env_summaries[key] = {
-                "mean_reward": float(np.mean(stats["rewards"])),
-                "mean_reward_per_fe": float(np.mean(stats["reward_per_fe"])),
-                "init_hv": float(np.mean(stats["init_hv"])),
-                "final_hv": float(np.mean(stats["final_hv"])),
-            }
-            igd_values = stats["final_igd"]
-            igd_text = f"{np.mean(igd_values):.12f}" if igd_values else "NA"
-            log(f"epoch {epoch}/{logged_epoch_target} | {key} | final IGD = {igd_text} | valid = {len(igd_values)}/{len(stats['rewards'])}")
-        reward_metric_name = "mean reward/FE"
-        mean_ep_reward = float(np.mean([
-            value["mean_reward_per_fe"] for value in per_env_summaries.values()
-        ])) if per_env_summaries else 0.0
-        if bool(getattr(cfg, "cuda_cleanup_before_update", False)):
-            _cleanup_cuda_cache(cfg.device, rounds=3, sleep_sec=1.0)
-        update_start_time = time.perf_counter()
 
-        if len(replay) < cfg.batch_size and not codein:
+            update_metrics_list = []
+            total_minibatch_sample_cpu_sec = 0.0
+            total_minibatch_to_gpu_sec = 0.0
+            # Recompute the sampled grades under the rollout policy before changing any weights.
+            if codein:
+                agent.eval()
+                decisions = [decision for result in results for decision in result["init_rollout"]]
+            else:
+                agent.train()
+            for update_idx in range(int(cfg.updates_per_epoch)):
+                minibatch_sample_started_at = time.perf_counter()
+                batch = replay.sample(min(cfg.batch_size, len(replay)))
+                minibatch_sample_cpu_sec = time.perf_counter() - minibatch_sample_started_at
+                loss, ddqn_metrics = compute_ddqn_loss(agent, target_agent, batch, cfg)
+                total_minibatch_sample_cpu_sec += float(minibatch_sample_cpu_sec)
+                total_minibatch_to_gpu_sec += float(ddqn_metrics.get("batch_to_device_sec", 0.0))
+
+                optimizer.zero_grad()
+                if codein:
+                    (cfg.q_coef * loss).backward()
+                    if update_idx == 0:
+                        init_loss, value_loss = backward_codein_init(agent, decisions, cfg)
+                        total_loss = init_loss + cfg.value_coef * value_loss + cfg.q_coef * loss.detach().item()
+                        log(f"[Epoch {epoch:04d}] init | decisions={len(decisions)} | "
+                            f"policy_loss={init_loss:.6f} | value_loss={value_loss:.6f} | total_loss={total_loss:.6f}")
+                else:
+                    loss.backward()
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
+                optimizer.step()
+                soft_update_target_network(target_agent, agent, cfg.target_soft_tau)
+
+                update_metrics = {
+                    "td_loss": float(loss.item()),
+                    "grad_norm": float(grad_norm),
+                    "q_mean": float(ddqn_metrics["q_mean"]),
+                    "q_std": float(ddqn_metrics["q_std"]),
+                    "target_mean": float(ddqn_metrics["target_mean"]),
+                    "td_error_mean": float(ddqn_metrics["td_error_mean"]),
+                    "td_error_std": float(ddqn_metrics["td_error_std"]),
+                    "reward_mean": float(ddqn_metrics["reward_mean"]),
+                    "batch_cpu_mb": float(ddqn_metrics.get("batch_cpu_mb", 0.0)),
+                    "batch_gpu_mb": float(ddqn_metrics.get("batch_gpu_mb", 0.0)),
+                    "archive_rows_mean": float(ddqn_metrics.get("archive_rows_mean", 0.0)),
+                    "candidate_rows_mean": float(ddqn_metrics.get("candidate_rows_mean", 0.0)),
+                    "archive_rows_max": int(ddqn_metrics.get("archive_rows_max", 0)),
+                    "candidate_rows_max": int(ddqn_metrics.get("candidate_rows_max", 0)),
+                    "shape_group": int(ddqn_metrics["shape_group"]),
+                    "group_sizes": list(ddqn_metrics["group_sizes"]),
+                    "shape_group_detail": dict(ddqn_metrics.get("shape_group_detail", {})),
+                }
+                update_metrics_list.append(update_metrics)
+
+            update_elapsed = time.perf_counter() - update_start_time
+
+            mean_update_metrics = {}
+            for key in [
+                "td_loss",
+                "grad_norm",
+                "q_mean",
+                "q_std",
+                "target_mean",
+                "td_error_mean",
+                "td_error_std",
+                "reward_mean",
+                "batch_cpu_mb",
+                "batch_gpu_mb",
+                "archive_rows_mean",
+                "candidate_rows_mean",
+            ]:
+                mean_update_metrics[key] = float(np.mean([m[key] for m in update_metrics_list]))
+            mean_update_metrics["archive_rows_max"] = int(max(m["archive_rows_max"] for m in update_metrics_list))
+            mean_update_metrics["candidate_rows_max"] = int(max(m["candidate_rows_max"] for m in update_metrics_list))
+            mean_update_metrics["shape_group"] = int(round(np.mean([m["shape_group"] for m in update_metrics_list])))
+            group_keys = sorted(
+                {
+                    int(obj)
+                    for m in update_metrics_list
+                    for obj in m.get("shape_group_detail", {}).keys()
+                }
+            )
+            mean_update_metrics["shape_group_summary"] = {
+                int(obj): float(np.mean([m.get("shape_group_detail", {}).get(int(obj), 0) for m in update_metrics_list]))
+                for obj in group_keys
+            }
+            if bool(getattr(cfg, "cuda_cleanup_after_update", False)):
+                _cleanup_cuda_cache(cfg.device, rounds=3, sleep_sec=1.0)
             log(
                 f"epoch {epoch}/{logged_epoch_target} | reward/FE = {mean_ep_reward:.4f} | "
-                f"replay = {len(replay)} | update = skipped"
+                f"replay = {len(replay)} | "
+                f"lr = {optimizer.param_groups[0]['lr']:.2e} | "
+                f"loss = {mean_update_metrics['td_loss']:.6f} | update_sec = {update_elapsed:.2f}"
             )
+
             if mean_ep_reward > best_reward:
                 log(f"new best {reward_metric_name} at epoch {epoch}: {mean_ep_reward:.4f}")
             best_reward = save_training_checkpoint(
@@ -1691,118 +1794,13 @@ def train_codein(
                 best_reward,
                 best_state_dict=pre_update_state_dict,
             )
-            continue
 
-        update_metrics_list = []
-        total_minibatch_sample_cpu_sec = 0.0
-        total_minibatch_to_gpu_sec = 0.0
-        # Recompute the sampled grades under the rollout policy before changing any weights.
-        if codein:
-            agent.eval()
-            decisions = [decision for result in results for decision in result["init_rollout"]]
-        else:
-            agent.train()
-        for update_idx in range(int(cfg.updates_per_epoch)):
-            minibatch_sample_started_at = time.perf_counter()
-            batch = replay.sample(min(cfg.batch_size, len(replay)))
-            minibatch_sample_cpu_sec = time.perf_counter() - minibatch_sample_started_at
-            loss, ddqn_metrics = compute_ddqn_loss(agent, target_agent, batch, cfg)
-            total_minibatch_sample_cpu_sec += float(minibatch_sample_cpu_sec)
-            total_minibatch_to_gpu_sec += float(ddqn_metrics.get("batch_to_device_sec", 0.0))
-
-            optimizer.zero_grad()
-            if codein:
-                (cfg.q_coef * loss).backward()
-                if update_idx == 0:
-                    init_loss, value_loss = backward_codein_init(agent, decisions, cfg)
-                    total_loss = init_loss + cfg.value_coef * value_loss + cfg.q_coef * loss.detach().item()
-                    log(f"[Epoch {epoch:04d}] init | decisions={len(decisions)} | "
-                        f"policy_loss={init_loss:.6f} | value_loss={value_loss:.6f} | total_loss={total_loss:.6f}")
-            else:
-                loss.backward()
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
-            optimizer.step()
-            soft_update_target_network(target_agent, agent, cfg.target_soft_tau)
-
-            update_metrics = {
-                "td_loss": float(loss.item()),
-                "grad_norm": float(grad_norm),
-                "q_mean": float(ddqn_metrics["q_mean"]),
-                "q_std": float(ddqn_metrics["q_std"]),
-                "target_mean": float(ddqn_metrics["target_mean"]),
-                "td_error_mean": float(ddqn_metrics["td_error_mean"]),
-                "td_error_std": float(ddqn_metrics["td_error_std"]),
-                "reward_mean": float(ddqn_metrics["reward_mean"]),
-                "batch_cpu_mb": float(ddqn_metrics.get("batch_cpu_mb", 0.0)),
-                "batch_gpu_mb": float(ddqn_metrics.get("batch_gpu_mb", 0.0)),
-                "archive_rows_mean": float(ddqn_metrics.get("archive_rows_mean", 0.0)),
-                "candidate_rows_mean": float(ddqn_metrics.get("candidate_rows_mean", 0.0)),
-                "archive_rows_max": int(ddqn_metrics.get("archive_rows_max", 0)),
-                "candidate_rows_max": int(ddqn_metrics.get("candidate_rows_max", 0)),
-                "shape_group": int(ddqn_metrics["shape_group"]),
-                "group_sizes": list(ddqn_metrics["group_sizes"]),
-                "shape_group_detail": dict(ddqn_metrics.get("shape_group_detail", {})),
-            }
-            update_metrics_list.append(update_metrics)
-
-        update_elapsed = time.perf_counter() - update_start_time
-
-        mean_update_metrics = {}
-        for key in [
-            "td_loss",
-            "grad_norm",
-            "q_mean",
-            "q_std",
-            "target_mean",
-            "td_error_mean",
-            "td_error_std",
-            "reward_mean",
-            "batch_cpu_mb",
-            "batch_gpu_mb",
-            "archive_rows_mean",
-            "candidate_rows_mean",
-        ]:
-            mean_update_metrics[key] = float(np.mean([m[key] for m in update_metrics_list]))
-        mean_update_metrics["archive_rows_max"] = int(max(m["archive_rows_max"] for m in update_metrics_list))
-        mean_update_metrics["candidate_rows_max"] = int(max(m["candidate_rows_max"] for m in update_metrics_list))
-        mean_update_metrics["shape_group"] = int(round(np.mean([m["shape_group"] for m in update_metrics_list])))
-        group_keys = sorted(
-            {
-                int(obj)
-                for m in update_metrics_list
-                for obj in m.get("shape_group_detail", {}).keys()
-            }
-        )
-        mean_update_metrics["shape_group_summary"] = {
-            int(obj): float(np.mean([m.get("shape_group_detail", {}).get(int(obj), 0) for m in update_metrics_list]))
-            for obj in group_keys
-        }
-        if bool(getattr(cfg, "cuda_cleanup_after_update", False)):
-            _cleanup_cuda_cache(cfg.device, rounds=3, sleep_sec=1.0)
-        log(
-            f"epoch {epoch}/{logged_epoch_target} | reward/FE = {mean_ep_reward:.4f} | "
-            f"replay = {len(replay)} | "
-            f"lr = {optimizer.param_groups[0]['lr']:.2e} | "
-            f"loss = {mean_update_metrics['td_loss']:.6f} | update_sec = {update_elapsed:.2f}"
-        )
-
-        if mean_ep_reward > best_reward:
-            log(f"new best {reward_metric_name} at epoch {epoch}: {mean_ep_reward:.4f}")
-        best_reward = save_training_checkpoint(
-            agent,
-            cfg,
-            cfg.heldout_problem,
-            epoch,
-            mean_ep_reward,
-            best_reward,
-            best_state_dict=pre_update_state_dict,
-        )
-
-    if executor is not None:
-        executor.shutdown(wait=True)
-    if bool(use_ray) and ray_mod is not None and ray_mod.is_initialized():
-        ray_mod.shutdown()
-    log_fp.close()
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+        if bool(use_ray) and ray_mod is not None and ray_mod.is_initialized():
+            ray_mod.shutdown()
+        log_fp.close()
     return agent
 
 

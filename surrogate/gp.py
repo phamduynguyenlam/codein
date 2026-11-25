@@ -101,6 +101,12 @@ class GPSurrogateModel(SurrogateModel):
             gp.fit(x_arr, y_arr[:, i])
         return self
 
+    @staticmethod
+    def _posterior_variance(gp, x: np.ndarray, k: np.ndarray) -> np.ndarray:
+        projected = solve_triangular(gp.L_, k.T, lower=True)
+        variance = gp.kernel_.diag(x) - np.einsum("ij,ij->j", projected, projected)
+        return np.maximum(variance, 0.0)
+
     def evaluate(
         self,
         x: np.ndarray,
@@ -121,13 +127,12 @@ class GPSurrogateModel(SurrogateModel):
             y_std = None
             k_inv = None
             if std:
-                l_inv = solve_triangular(gp.L_.T, np.eye(gp.L_.shape[0]))
-                k_inv = l_inv.dot(l_inv.T)
-                y_var = gp.kernel_.diag(x_arr)
-                y_var -= np.einsum("ij,ij->i", np.dot(k, k_inv), k)
-                y_var[y_var < 0] = 0.0
+                y_var = self._posterior_variance(gp, x_arr, k)
                 y_std = np.sqrt(y_var)
                 s_list.append(y_std)
+                if calc_gradient or calc_hessian:
+                    l_inv = solve_triangular(gp.L_.T, np.eye(gp.L_.shape[0]))
+                    k_inv = l_inv.dot(l_inv.T)
 
             if not (calc_gradient or calc_hessian):
                 continue
@@ -220,10 +225,12 @@ class GPSurrogateModel(SurrogateModel):
         return self.evaluate(x, std=False)["F"]
 
     def predict_std(self, x: np.ndarray) -> np.ndarray:
-        out = self.evaluate(x, std=True)["S"]
-        if out is None:
-            raise RuntimeError("Failed to compute GP predictive std.")
-        return out + 1e-6
+        x_arr = np.asarray(x, dtype=np.float64)
+        standard_deviations = [
+            np.sqrt(self._posterior_variance(gp, x_arr, gp.kernel_(x_arr, gp.X_train_)))
+            for gp in self.gps
+        ]
+        return np.stack(standard_deviations, axis=1).astype(np.float32) + 1e-6
 
 
 def fit_gp_surrogates(
