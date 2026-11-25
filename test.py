@@ -864,8 +864,8 @@ def feasible_metrics(archive_y, archive_g, ref_point, true_pareto):
     if not len(feasible):
         return feasible, 0.0, None
     front = pareto_front(feasible)
-    # Distances run from each true-front point to its nearest approximation.
-    igd = None if true_pareto is None else float(cKDTree(front).query(true_pareto)[0].mean())
+    # Use every feasible evaluation so dominated archive points remain eligible neighbors.
+    igd = None if true_pareto is None else float(cKDTree(feasible).query(true_pareto)[0].mean())
     return front, hypervolume(front, ref_point), igd
 
 
