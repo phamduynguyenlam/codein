@@ -55,3 +55,15 @@ python test.py --problem DAS-CMOP1 --seeds 0 1 --init_fe 6 --max_fe 8 --offsprin
 ## Problem interface
 
 Each problem returns objective and constraint matrices `(F, G)` through `evaluate_with_constraints(x)`. Feasibility means `G <= 0` for every constraint. An unconstrained problem uses `G` with shape `[N, 0]`. CodeIn fixes each constraint scale to the maximum absolute initial LHS value, floored at `1e-8`.
+
+## EIC-MSSAEA baseline
+
+```powershell
+python baseline/eic_mssaea.py --problem DAS-CMOP4 --init_fe 100 --max_fe 300 --generations 15 --seed 0
+```
+
+This standalone baseline uses the repository GP, the NSGA-III solver and shared infill geometry. It implements unconstrained objective search, single-constraint violation as an additional objective, and full constrained search, followed by serial ND-A, ND-delta-PBI and EPDI selection with CDP/PoF in stages 2 and 3. Each batch evaluates up to three distinct points. The final batch respects the remaining evaluation budget.
+
+Defaults follow Table I of Wu et al., *A Multistage Expensive Constrained Multiobjective Optimization Algorithm Based on Ensemble Infill Criterion*, DOI 10.1109/TEVC.2024.3400832, except for the requested use of the existing GP. Defaults are `init_fe=11*dim-1`, `max_fe=400`, `pop_size=100`, `generations=20`, `mc_samples=1000`, `tau1=0.5`, `tau2=0.7` and `transition_rounds=8`. The early stage-transition check counts the first `transition_rounds` batches after LHS, resolving the paper's ambiguous `FE=3*Tr` condition. Reference directions and variation operators are supplied to the shared solver for this baseline.
+
+Runs save a text log and JSON under `testing_logs/<problem>/`, including stage, selected criterion, full archives, HV and IGD histories. IGD uses all accumulated feasible evaluations, following the current repository metric. Figures are omitted. Use `--output_json` and `--log_path` to choose destinations.

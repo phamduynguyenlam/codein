@@ -114,6 +114,9 @@ def run_surrogate_nsga3(
     surrogate_nsga_steps=None,
     seed_x=None,
     constraint_surrogate=None,
+    ref_dirs=None,
+    crossover=None,
+    mutation=None,
 ):
     requested_pop_size = int(pop_size)
     if surrogate_nsga_steps is not None:
@@ -152,12 +155,22 @@ def run_surrogate_nsga3(
         xu=problem.xu,
     )
 
-    ref_dirs = _build_reference_directions(int(problem.n_obj), requested_pop_size, int(seed))
+    if ref_dirs is None:
+        ref_dirs = _build_reference_directions(int(problem.n_obj), requested_pop_size, int(seed))
+    ref_dirs = np.asarray(ref_dirs, dtype=np.float64)
+    if ref_dirs.ndim != 2 or ref_dirs.shape[1] != int(problem.n_obj) or not len(ref_dirs):
+        raise ValueError("Reference directions must have shape [N, n_obj].")
+    operators = {}
+    if crossover is not None:
+        operators["crossover"] = crossover
+    if mutation is not None:
+        operators["mutation"] = mutation
     algorithm = NSGA3(
         pop_size=requested_pop_size,
         ref_dirs=ref_dirs,
         sampling=initial,
         eliminate_duplicates=True,
+        **operators,
     )
 
     res = minimize(

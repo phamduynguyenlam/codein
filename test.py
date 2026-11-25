@@ -477,6 +477,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--solver", type=normalize_solver_name, choices=POOL_SOLVERS, default=DEFAULT_POOL_SOLVER)
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--plot_path", type=str, default=None)
+    parser.add_argument("--no_plot", action="store_true", help="Skip creating and displaying plots.")
     args = parser.parse_args()
     args.surrogate_model = "gp"
     args.reward_lambda = None
@@ -1770,7 +1771,9 @@ def main(agent_name: str = "codein") -> None:
     if infill_names or algo_names:
         run_tag += "_compare"
     series = [(label, aggregate[group, name], histories[group, name][0]) for group, name, label, _, _ in cases]
-    plot_path, pdf_path = plot_metric_curves(args, series, true_pareto, run_tag)
+    plot_path, pdf_path = None, None
+    if not args.no_plot:
+        plot_path, pdf_path = plot_metric_curves(args, series, true_pareto, run_tag)
     primary_metrics = aggregate["primary", primary]
     summary = {
         "problem": args.problem, "dim": args.dim, "seeds": seeds,
