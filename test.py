@@ -873,6 +873,11 @@ def format_igd(igd):
     return "NA" if igd is None else f"{igd:.12f}"
 
 
+def log_batch_metrics(logger, fe, hv, igd, prefix=""):
+    if fe % 5 == 0:
+        logger(f"{prefix}FE = {fe} | HV = {hv:.12f} | IGD = {format_igd(igd)}")
+
+
 def remove_offspring_candidate(
     offspring_x: np.ndarray,
     offspring_pred: np.ndarray,
@@ -966,7 +971,7 @@ def run_policy_rollout_batched(
         infill_criterion.reset()
 
     prefix = format_policy_prefix(policy_name)
-    logger(f"{prefix}iter 0 | FE = {fe_history[0]} | front = {len(front)} | HV = {hv:.12f} | IGD = {format_igd(igd)}")
+    log_batch_metrics(logger, fe_history[0], hv, igd, prefix)
 
     step = 0
     pool_id = 0
@@ -1169,9 +1174,7 @@ def run_policy_rollout_batched(
             history.append(record)
             step_rewards.append(step_reward)
 
-            log_line = f"{prefix}iter {record.step} | FE = {record.fe} | front = {front_size} | HV = {record.hv:.12f} | IGD = {format_igd(record.igd)}"
-            log_line += f" | reward = {record.reward:.6f}"
-            logger(log_line)
+            log_batch_metrics(logger, record.fe, record.hv, record.igd, prefix)
 
             old_pool_size = int(offspring_x.shape[0])
             offspring_x, offspring_pred, offspring_sigma, offspring_groups = remove_offspring_candidate(
@@ -1301,7 +1304,7 @@ def run_policy_rollout(
         infill_criterion.reset()
 
     prefix = format_policy_prefix(policy_name)
-    logger(f"{prefix}iter 0 | FE = {fe_history[0]} | front = {len(front)} | HV = {hv:.12f} | IGD = {format_igd(igd)}")
+    log_batch_metrics(logger, fe_history[0], hv, igd, prefix)
 
     pool_solver = resolve_rollout_solver(args, policy_key, infill_criterion)
     for step in range(n_evo_steps):
@@ -1453,9 +1456,7 @@ def run_policy_rollout(
         history.append(record)
         step_rewards.append(step_reward)
 
-        log_line = f"{prefix}iter {record.step} | FE = {record.fe} | front = {front_size} | HV = {record.hv:.12f} | IGD = {format_igd(record.igd)}"
-        log_line += f" | reward = {record.reward:.6f}"
-        logger(log_line)
+        log_batch_metrics(logger, record.fe, record.hv, record.igd, prefix)
     final_front = front
     summary = {
         "problem": args.problem,

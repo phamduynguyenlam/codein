@@ -73,32 +73,11 @@ def _reference_front(name: str, dim: int) -> np.ndarray:
     from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
     problem = make_problem(name, dim)
-    if problem_family(name) == "MW":
-        try:
-            with np.errstate(divide="ignore"):
-                front = problem.pymoo_problem.pareto_front()
-        except Exception as exc:
-            raise RuntimeError(f"Could not load the pymoo reference front for {name}.") from exc
-    else:
-        lead_count = problem.n_obj - 1
-        axis = np.linspace(0.0, 1.0, 4097 if lead_count == 1 else 257)
-        lead = axis[:, None] if lead_count == 1 else np.column_stack(
-            [grid.ravel() for grid in np.meshgrid(axis, axis, indexing="ij")]
-        )
-        x = np.empty((len(lead), problem.dim))
-        x[:, :lead_count] = lead
-        index = DAS_PROBLEMS.index(name) + 1
-        # At difficulty 1 the tail minimizing g is feasible whenever the
-        # angular constraints hold. Increasing g worsens every objective.
-        if index <= 3:
-            x[:, lead_count:] = np.sin(0.5 * np.pi * x[:, :1])
-        elif index <= 8:
-            x[:, lead_count:] = 0.5
-        else:
-            j = np.arange(lead_count + 1, problem.dim + 1)
-            x[:, lead_count:] = np.cos(0.25 * np.pi * j / problem.dim * x[:, :2].sum(axis=1, keepdims=True))
-        f, g = problem.evaluate_with_constraints(x)
-        front = f[(g <= 1e-10).all(axis=1)]
+    try:
+        with np.errstate(divide="ignore"):
+            front = problem.pymoo_problem.pareto_front()
+    except Exception as exc:
+        raise RuntimeError(f"Could not load the pymoo reference front for {name}.") from exc
 
     front = np.asarray(front, dtype=np.float64)
     if front.ndim != 2 or not len(front) or front.shape[1] != problem.n_obj or not np.isfinite(front).all():
