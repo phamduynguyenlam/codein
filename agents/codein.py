@@ -46,20 +46,12 @@ class CodeIn(BaseAgent):
     """Neural Hierarchical Infill Sampling with seed grading and infill Q-values."""
 
     def __init__(self, hidden_dim=128, n_heads=8, ff_dim=256, dropout=0.0):
-        super().__init__(
-            hidden_dim, n_heads, ff_dim, dropout,
-            use_cross_space_attention=False,
-        )
+        super().__init__(hidden_dim, n_heads, ff_dim, dropout)
         self.archive_attention = TsAttnBlock(hidden_dim, n_heads, ff_dim, dropout)
         self.offspring_attention = TsAttnBlock(hidden_dim, n_heads, ff_dim, dropout)
         self.constraint_encoder = _ConstraintEncoder(hidden_dim, dropout, input_dim=3)
         self.archive_fusion = self._fusion_mlp(hidden_dim)
         self.offspring_fusion = self._fusion_mlp(hidden_dim)
-        self.infill_fusion = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
         self.init_head = nn.Sequential(
             nn.Linear(2 * hidden_dim + 2, hidden_dim),
             nn.GELU(),
@@ -453,12 +445,10 @@ class DiscAF(BaseAgent):
         s_surr_obj = self.surr_objective_attn(s_surr_obj)
         s_surr = s_surr_obj.reshape(bsz, n_surr, n_obj, hidden_dim).permute(0, 2, 1, 3)
         h_surr_raw = s_surr.mean(dim=1)
-        h_surr = self.cross_space_attn(
-            h_surr_raw,
-            h_true,
-            h_true,
-            key_padding_mask=(~archive_mask),
-        )
+        h_A = _masked_mean(h_true, archive_mask)
+        archive_context = h_A.unsqueeze(1).expand(-1, h_surr_raw.size(1), -1)
+        h_surr = self.infill_fusion(torch.cat((h_surr_raw, archive_context), dim=-1))
+        h_surr = h_surr.masked_fill(~candidate_mask.unsqueeze(-1), 0.0)
 
         progress = self._prepare_progress(
             progress=progress,

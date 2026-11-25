@@ -93,38 +93,6 @@ class LandscapeEncoder(nn.Module):
         return masked_sum / denom
 
 
-class CrossSpaceAttention(nn.Module):
-    def __init__(self, hidden_dim, n_heads, ff_dim, dropout=0.0):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=n_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(hidden_dim, ff_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, hidden_dim),
-        )
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, query, key, value, key_padding_mask=None):
-        attn_out, _ = self.attn(
-            query,
-            key,
-            value,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
-        x = self.norm1(query + self.dropout(attn_out))
-        ff_out = self.ff(x)
-        return self.norm2(x + self.dropout(ff_out))
-
-
 class BaseAgent(nn.Module):
     def __init__(
         self,
@@ -132,8 +100,6 @@ class BaseAgent(nn.Module):
         n_heads=8,
         ff_dim=256,
         dropout=0.0,
-        *,
-        use_cross_space_attention=True,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -141,8 +107,11 @@ class BaseAgent(nn.Module):
         self.W_surr = nn.Linear(3, hidden_dim)
         self.encoder_true = LandscapeEncoder(hidden_dim, n_heads, ff_dim, dropout)
         self.encoder_surr = LandscapeEncoder(hidden_dim, n_heads, ff_dim, dropout)
-        if use_cross_space_attention:
-            self.cross_space_attn = CrossSpaceAttention(hidden_dim, n_heads, ff_dim, dropout)
+        self.infill_fusion = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
     @staticmethod
     def _ensure_batch(x):
@@ -345,12 +314,11 @@ class BaseAgent(nn.Module):
 
         h_true = s_true.mean(dim=1)
         h_surr_raw = s_surr.mean(dim=1)
-        h_surr = self.cross_space_attn(
-            h_surr_raw,
-            h_true,
-            h_true,
-            key_padding_mask=(~archive_mask),
-        )
+        valid_archive = h_true.masked_fill(~archive_mask.unsqueeze(-1), 0.0)
+        h_A = valid_archive.sum(dim=1) / archive_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        archive_context = h_A.unsqueeze(1).expand(-1, h_surr_raw.size(1), -1)
+        h_surr = self.infill_fusion(torch.cat((h_surr_raw, archive_context), dim=-1))
+        h_surr = h_surr.masked_fill(~candidate_mask.unsqueeze(-1), 0.0)
 
         progress = self._prepare_progress(
             progress=progress,
