@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from agents.codein import DiscAF, CodeIn, tensor_policy_state
+from agents.codein import ARCHIVE_INPUTS, DiscAF, CodeIn, tensor_policy_state
 from solver.solver import DEFAULT_POOL_SOLVER, POOL_SOLVERS, normalize_solver_name, solve
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
 from problem.problem import DAS_PROBLEMS, DEFAULT_TRAIN_DIM, MW_PROBLEMS, get_reference_point, make_problem, reference_front
@@ -84,6 +84,7 @@ class TrainConfig:
     num_seeds: int = 40
     temperature: float = 1.0
     value_coef: float = 0.5
+    offspring_value_coef: float = 0.5
     q_coef: float = 1.0
     prediction_history_steps: int = 40
     cuda_cleanup_before_update: bool = False
@@ -266,10 +267,12 @@ def soft_update_target_network(target_model, online_model, tau: float) -> None:
     tau_value = float(tau)
     one_minus_tau = 1.0 - tau_value
     with torch.no_grad():
-        for target_param, online_param in zip(target_model.parameters(), online_model.parameters()):
-            target_param.data.mul_(one_minus_tau).add_(online_param.data, alpha=tau_value)
-        for target_buffer, online_buffer in zip(target_model.buffers(), online_model.buffers()):
-            target_buffer.copy_(online_buffer)
+        online_parameters = dict(online_model.named_parameters())
+        for name, target_param in target_model.named_parameters():
+            target_param.data.mul_(one_minus_tau).add_(online_parameters[name].data, alpha=tau_value)
+        online_buffers = dict(online_model.named_buffers())
+        for name, target_buffer in target_model.named_buffers():
+            target_buffer.copy_(online_buffers[name])
 
 
 def resolve_agent_cls(agent_name):
@@ -321,6 +324,7 @@ def parse_args(configure_parser=None):
     parser.add_argument("--temperature", type=float, default=TrainConfig.temperature)
     parser.add_argument("--value_coef", type=float, default=TrainConfig.value_coef)
     parser.add_argument("--q_coef", type=float, default=TrainConfig.q_coef)
+    parser.add_argument("--offspring_value_coef", type=float, default=TrainConfig.offspring_value_coef)
     if configure_parser is not None:
         configure_parser(parser)
     args = parser.parse_args()
@@ -504,6 +508,58 @@ def backward_codein_init(agent, decisions, cfg):
             policy_loss += weight * init.detach().item()
             value_loss += weight * value.detach().item()
     return policy_loss, value_loss
+
+
+def finish_offspring_critic_samples(samples, rewards, gamma):
+    if len(samples) != len(rewards):
+        raise ValueError("Each offspring critic state must have one evaluation reward.")
+    completed = [None] * len(samples)
+    discounted = 0.0
+    for index in range(len(samples) - 1, -1, -1):
+        if index == len(samples) - 1 or samples[index + 1][3] == 0:
+            discounted = 0.0
+        discounted = float(rewards[index]) + float(gamma) * discounted
+        completed[index] = (*samples[index], discounted)
+    return completed
+
+
+def compute_offspring_value_loss(agent, samples, device):
+    states, parent_indices, selected_indices, steps, lengths, returns = zip(*samples)
+    keys = ("x_true", "y_true", "progress", "lower_bound", "upper_bound")
+    inputs = {key: to_tensor(pad_stack_rows([state[key] for state in states]), device) for key in keys}
+    inputs.update(_batch_codein_constraints(states, device, include_offspring=False))
+    archive_mask = build_row_mask([state["x_true"] for state in states])
+    inputs["archive_mask"] = torch.as_tensor(archive_mask, device=device)
+    membership = []
+    for indices_per_state in (parent_indices, selected_indices):
+        mask = np.zeros_like(archive_mask, dtype=bool)
+        for row, indices in enumerate(indices_per_state):
+            indices = np.asarray(indices, dtype=np.int64)
+            if np.any(indices < 0) or np.any(indices >= len(states[row]["x_true"])):
+                raise ValueError("Cycle membership must refer to existing archive rows.")
+            mask[row, indices] = True
+        membership.append(torch.as_tensor(mask, device=device))
+    values = agent.offspring_value(
+        parent_mask=membership[0], selected_mask=membership[1],
+        cycle_step=steps, cycle_length=lengths, **inputs,
+    )
+    targets = to_tensor(returns, device).detach()
+    return 0.5 * (values - targets).square().mean()
+
+
+def backward_offspring_value(agent, samples, cfg):
+    groups = {}
+    for sample in samples:
+        groups.setdefault(sample[0]["y_true"].shape[1], []).append(sample)
+    total_loss = 0.0
+    for group in groups.values():
+        for start in range(0, len(group), 4):
+            chunk = group[start:start + 4]
+            loss = compute_offspring_value_loss(agent, chunk, cfg.device)
+            weight = len(chunk) / len(samples)
+            (cfg.offspring_value_coef * weight * loss).backward()
+            total_loss += weight * loss.detach().item()
+    return total_loss
 
 
 def _compute_ddqn_loss_same_objectives(agent, target_agent, batch, cfg):
@@ -933,7 +989,8 @@ class DiscSAEAEnv:
                     sample=True, **tensor_policy_state(state, self.cfg.get("rollout_device", "cpu")),
                 )
             self.init_decisions.append((self.t, state, grades[0].cpu().numpy(), log_probs[0].cpu().numpy()))
-            seed_x = self.archive_x[indices[0].cpu().numpy()]
+            self.parent_indices = indices[0].cpu().numpy().copy()
+            seed_x = self.archive_x[self.parent_indices]
         constraint_surrogate = None
         solver_name = normalize_solver_name(self.cfg.get("solver", DEFAULT_POOL_SOLVER))
         if self.archive_g.shape[1] and (self.init_policy is not None or solver_name in {"nsga2", "nsga3"}):
@@ -959,6 +1016,8 @@ class DiscSAEAEnv:
             else:
                 self.g_sur_mean = constraint_surrogate.predict_mean(self.offspring_x)
                 self.g_sur_std = constraint_surrogate.predict_std(self.offspring_x)
+            self.cycle_selected_indices = []
+            self.cycle_length = min(self.eval_batch_size, self.max_steps - self.t, len(self.offspring_x))
         self._pool_eval_count = 0
 
     def _remove_offspring_candidate(self, selected_idx: int) -> None:
@@ -1013,6 +1072,9 @@ class DiscSAEAEnv:
         if self.init_policy is not None:
             state.update(
                 seed_count=self.seed_count, g_sur_mean=self.g_sur_mean.copy(), g_sur_std=self.g_sur_std.copy(),
+                parent_indices=self.parent_indices,
+                selected_indices=np.asarray(self.cycle_selected_indices, dtype=np.int64),
+                cycle_step=len(self.cycle_selected_indices), cycle_length=self.cycle_length,
             )
         return state
 
@@ -1074,6 +1136,8 @@ class DiscSAEAEnv:
 
         self.archive_x = np.vstack([self.archive_x, chosen_x]).astype(np.float32)
         self.archive_y = np.vstack([self.archive_y, chosen_y]).astype(np.float32)
+        if self.init_policy is not None:
+            self.cycle_selected_indices.append(len(self.archive_x) - 1)
 
         self.t += 1
         done = self.t >= self.max_steps
@@ -1156,7 +1220,10 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     agent = agent_cls(**agent_init_kwargs)
     agent = agent.to(device)
 
-    agent.load_state_dict(state_dict_cpu)
+    if isinstance(agent, CodeIn):
+        agent.load_checkpoint_state_dict(state_dict_cpu)
+    else:
+        agent.load_state_dict(state_dict_cpu)
     agent.eval()
     codein = isinstance(agent, CodeIn)
 
@@ -1171,10 +1238,18 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     total_reward = 0.0
     init_hv = float(env.init_hv)
     transitions = []
+    offspring_samples = []
     disc_steps = 0
 
     done = False
     while not done:
+        if codein:
+            # Share the same archive arrays already retained by the replay transition.
+            offspring_samples.append((
+                {key: state[key] for key in ARCHIVE_INPUTS},
+                state["parent_indices"], state["selected_indices"],
+                state["cycle_step"], state["cycle_length"],
+            ))
         with torch.no_grad():
             if codein:
                 out = agent(**tensor_policy_state(state, device, include_offspring=True))
@@ -1210,7 +1285,12 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
         state = next_state
 
     init_rollout = []
+    offspring_rollout = []
     if codein:
+        offspring_rollout = finish_offspring_critic_samples(
+            offspring_samples, [transition[11] for transition in transitions],
+            cfg_dict.get("gamma", TrainConfig.gamma),
+        )
         returns = [0.0] * len(transitions)
         discounted = 0.0
         for i in range(len(transitions) - 1, -1, -1):
@@ -1231,6 +1311,7 @@ def _rollout_episode_impl(state_dict_cpu, cfg_dict, problem_name, dim, seed, eps
     return {
         "transitions": transitions,
         "init_rollout": init_rollout,
+        "offspring_rollout": offspring_rollout,
         "episode_reward": float(total_reward),
         "episode_steps": int(len(transitions)),
         "logging_reward": float(total_reward),
@@ -1319,6 +1400,8 @@ def save_training_checkpoint(
                 "reward": normalize_reward(cfg.reward),
                 "mean_reward": float(mean_reward),
                 "state_dict": state_dict_to_save,
+                "config": cfg.__dict__.copy(),
+                "offspring_value_coef": cfg.offspring_value_coef,
             },
             best_path,
         )
@@ -1332,6 +1415,8 @@ def save_training_checkpoint(
             "reward": normalize_reward(cfg.reward),
             "mean_reward": float(mean_reward),
             "state_dict": agent.state_dict(),
+            "config": cfg.__dict__.copy(),
+            "offspring_value_coef": cfg.offspring_value_coef,
         },
         epoch_path,
     )
@@ -1385,6 +1470,7 @@ def train_codein(
     q_coef=TrainConfig.q_coef,
     init_fe=None,
     max_fe=None,
+    offspring_value_coef=TrainConfig.offspring_value_coef,
 ):
     cfg = TrainConfig()
     if init_fe is not None:
@@ -1428,14 +1514,15 @@ def train_codein(
     cfg.num_seeds = int(num_seeds)
     cfg.temperature = float(temperature)
     cfg.value_coef, cfg.q_coef = float(value_coef), float(q_coef)
+    cfg.offspring_value_coef = float(offspring_value_coef)
     codein = cfg.agent_name == "codein"
     if codein:
         cfg.policy_mode = "softmax_sample"
         cfg.reward_norm = False
         if cfg.num_seeds < 1 or not math.isfinite(cfg.temperature) or cfg.temperature <= 0:
             raise ValueError("num_seeds must be positive and temperature must be finite and positive.")
-        if any(not math.isfinite(coef) or coef < 0 for coef in (cfg.value_coef, cfg.q_coef)):
-            raise ValueError("value_coef and q_coef must be finite and nonnegative.")
+        if any(not math.isfinite(coef) or coef < 0 for coef in (cfg.value_coef, cfg.q_coef, cfg.offspring_value_coef)):
+            raise ValueError("value_coef, q_coef and offspring_value_coef must be finite and nonnegative.")
         if cfg.updates_per_epoch < 1:
             raise ValueError("CodeIn requires at least one update per rollout epoch.")
     if num_workers is not None:
@@ -1464,6 +1551,9 @@ def train_codein(
     agent = agent_cls(**build_agent_init_kwargs(cfg, epsilon=cfg.epsilon_start)).to(cfg.device)
 
     target_agent = copy.deepcopy(agent).to(cfg.device)
+    if codein:
+        # The auxiliary critic has Monte Carlo targets and no target-network copy.
+        del target_agent.offspring_critic
     target_agent.eval()
 
     optimizer = optim.Adam(agent.parameters(), lr=cfg.lr)
@@ -1539,12 +1629,15 @@ def train_codein(
         config_parts.extend([
             f"num_seeds={cfg.num_seeds}", f"temperature={cfg.temperature:g}",
             f"value_coef={cfg.value_coef:g}", f"q_coef={cfg.q_coef:g}",
+            f"offspring_value_coef={cfg.offspring_value_coef:g}",
         ])
     training_config_message = (
         f"training | heldout = {cfg.heldout_problem} | set = 1 | "
         f"agent = {cfg.agent_name} | solver = {cfg.solver} | surrogate = {effective_surrogate_label(cfg)} | "
         f"epochs = {logged_epoch_target} | workers = {actual_num_workers}"
     )
+    if codein:
+        training_config_message += f" | offspring_value_coef = {cfg.offspring_value_coef:g}"
     log(training_config_message)
     replay = ReplayBuffer(cfg.replay_size)
     try:
@@ -1697,6 +1790,7 @@ def train_codein(
             if codein:
                 agent.eval()
                 decisions = [decision for result in results for decision in result["init_rollout"]]
+                offspring_samples = [sample for result in results for sample in result["offspring_rollout"]]
             else:
                 agent.train()
             for update_idx in range(int(cfg.updates_per_epoch)):
@@ -1712,9 +1806,13 @@ def train_codein(
                     (cfg.q_coef * loss).backward()
                     if update_idx == 0:
                         init_loss, value_loss = backward_codein_init(agent, decisions, cfg)
-                        total_loss = init_loss + cfg.value_coef * value_loss + cfg.q_coef * loss.detach().item()
-                        log(f"[Epoch {epoch:04d}] init | decisions={len(decisions)} | "
-                            f"policy_loss={init_loss:.6f} | value_loss={value_loss:.6f} | total_loss={total_loss:.6f}")
+                        offspring_value_loss = backward_offspring_value(agent, offspring_samples, cfg)
+                        total_loss = (init_loss + cfg.value_coef * value_loss + cfg.q_coef * loss.detach().item()
+                                      + cfg.offspring_value_coef * offspring_value_loss)
+                        log(f"[Epoch {epoch:04d}] losses | decisions={len(decisions)} | "
+                            f"parent_loss={init_loss:.6f} | init_value_loss={value_loss:.6f} | "
+                            f"offspring_value_loss={offspring_value_loss:.6f} | q_loss={loss.item():.6f} | "
+                            f"offspring_critic_samples={len(offspring_samples)} | total_loss={total_loss:.6f}")
                 else:
                     loss.backward()
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0))
@@ -1833,4 +1931,5 @@ if __name__ == "__main__":
         temperature=args.temperature,
         value_coef=args.value_coef,
         q_coef=args.q_coef,
+        offspring_value_coef=args.offspring_value_coef,
     )

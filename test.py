@@ -452,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_fe", type=int, default=300)
     parser.add_argument("--init_fe", type=int, default=100)
     parser.add_argument("--batch", type=int, default=5, help="Evaluations per candidate pool.")
-    parser.add_argument("--offspring_size", type=int, default=None)
+    parser.add_argument("--offspring_size", type=int, default=40)
     parser.add_argument("--parents", dest="num_seeds", type=int, default=40)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--reward", type=normalize_reward, choices=REWARD_CHOICES, default=DEFAULT_REWARD)
@@ -482,10 +482,7 @@ def parse_args() -> argparse.Namespace:
     args.surrogate_model = "gp"
     args.reward_lambda = None
     args.problem = str(args.problem).upper()
-    args.offspring_size_user = args.offspring_size is not None
     args.saea_steps = 15
-    if not args.offspring_size_user:
-        args.offspring_size = 150
     if is_random_agent_path(args.compare_agent_pth):
         args.compare_agent_pth = None
         args.compare_random_model = True
@@ -599,7 +596,7 @@ def generate_offspring_pool(
         archive_x=archive_x,
         archive_y=archive_y,
         surrogate=surrogate,
-        pop_size=int(args.offspring_size) if bool(getattr(args, "offspring_size_user", False)) else len(archive_x),
+        pop_size=int(args.offspring_size),
         saea_steps=int(args.saea_steps),
         seed=int(args.seed) + int(step),
         seed_x=seed_x,
@@ -737,7 +734,10 @@ def build_agent(
 
     if state_dict is not None:
         load_state_dict_started_at = time.perf_counter()
-        disc.load_state_dict(state_dict, strict=True)
+        if isinstance(disc, CodeIn):
+            disc.load_checkpoint_state_dict(state_dict)
+        else:
+            disc.load_state_dict(state_dict, strict=True)
         load_state_dict_sec = time.perf_counter() - load_state_dict_started_at
 
     return disc, {
@@ -995,7 +995,7 @@ def run_policy_rollout_batched(
         if archive_g.shape[1] and (codein or pool_solver in {"nsga2", "nsga3"}):
             constraint_gp = build_surrogate(args, archive_x, archive_g)
         if codein:
-            population_size = args.offspring_size if args.offspring_size_user else len(archive_x)
+            population_size = int(args.offspring_size)
             seed_count = min(int(args.num_seeds), len(archive_x), int(population_size))
             archive_state = dict(
                 x_true=archive_x, y_true=archive_y, g_true=archive_g, constraint_scale=scale,
@@ -1011,7 +1011,7 @@ def run_policy_rollout_batched(
                 problem=nsga2_problem,
                 archive_x=archive_x,
                 archive_y=archive_y,
-                pop_size=int(args.offspring_size) if args.offspring_size_user else None,
+                pop_size=int(args.offspring_size),
                 saea_steps=int(args.saea_steps),
                 batch_size=pool_evals,
                 gp_restarts=3,
@@ -1316,7 +1316,7 @@ def run_policy_rollout(
                 problem=nsga2_problem,
                 archive_x=archive_x,
                 archive_y=archive_y,
-                pop_size=int(args.offspring_size) if bool(getattr(args, "offspring_size_user", False)) else None,
+                pop_size=int(args.offspring_size),
                 saea_steps=int(args.saea_steps),
                 batch_size=1,
                 gp_restarts=3,

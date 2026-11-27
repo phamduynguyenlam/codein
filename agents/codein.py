@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 
 from agents.base import BaseAgent, TsAttnBlock
 from agents.critic import InitCritic
+from agents.offspring_critic import OffspringCritic
 from agents.dueling_q import DuelingQDecoder
 
 
@@ -59,6 +60,7 @@ class CodeIn(BaseAgent):
         )
         self.critic = InitCritic(hidden_dim)
         self.q_decoder = DuelingQDecoder(hidden_dim, aux_dim=2, dropout=dropout, logit_scale=1.0)
+        self.offspring_critic = OffspringCritic(hidden_dim)
 
     @staticmethod
     def _fusion_mlp(hidden_dim):
@@ -142,6 +144,27 @@ class CodeIn(BaseAgent):
         count = torch.as_tensor(seed_count, device=h_A.device, dtype=h_A.dtype)
         k = count.reshape(-1, 1) / mask.sum(dim=1, keepdim=True).clamp_min(1)
         return h_a, h_A, torch.cat((p, k), dim=-1), mask
+
+    def load_checkpoint_state_dict(self, state_dict):
+        expected = set(self.state_dict())
+        supplied = set(state_dict)
+        critic_keys = {name for name in expected if name.startswith("offspring_critic.")}
+        missing, unexpected = expected - supplied, supplied - expected
+        if missing == critic_keys and not unexpected:
+            result = super().load_state_dict(state_dict, strict=False)
+            print("Checkpoint has no OffspringCritic parameters. OffspringCritic initialized with new weights.", flush=True)
+            return result
+        return super().load_state_dict(state_dict, strict=True)
+
+    def offspring_value(self, parent_mask, selected_mask, cycle_step, cycle_length, **archive_state):
+        embeddings, archive, budget, archive_mask = self.encode_archive(**archive_state)
+        parent_mask = torch.as_tensor(parent_mask, device=embeddings.device, dtype=torch.bool)
+        selected_mask = torch.as_tensor(selected_mask, device=embeddings.device, dtype=torch.bool)
+        if parent_mask.shape != archive_mask.shape or selected_mask.shape != archive_mask.shape:
+            raise ValueError("Parent and selected masks must match archive_mask shape.")
+        parents = _masked_mean(embeddings, parent_mask & archive_mask)
+        selected = _masked_mean(embeddings, selected_mask & archive_mask)
+        return self.offspring_critic(archive, parents, selected, budget[:, :1], cycle_step, cycle_length)
 
     def init_policy(self, **archive_state):
         h_a, h_A, budget, mask = self.encode_archive(**archive_state)
