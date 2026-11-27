@@ -54,7 +54,7 @@ class TrainConfig:
     eval_batch_size: int = 5
     batch_size: int = 64
     replay_size: int = 50000
-    gamma: float = 0.99
+    gamma: float = 0.95
     lr: float = 1e-4
     target_soft_tau: float = 1e-3
     train_iters: int = 50
@@ -328,7 +328,7 @@ def parse_args(configure_parser=None):
     if configure_parser is not None:
         configure_parser(parser)
     args = parser.parse_args()
-    args.gamma = 0.99
+    args.gamma = TrainConfig.gamma
     args.reward_norm = True
     args.surrogate_model = "gp"
     args.updates_per_epoch = None

@@ -22,7 +22,6 @@ import torch
 
 from agents.codein import DiscAF, CodeIn, tensor_policy_state
 from problem.constraints import evaluate_objectives_and_constraints, initial_constraint_scale
-from baseline.moead_ego import propose_moead_ego_candidates
 from infill import (
     EPDIExploitation,
     EPDIExploration,
@@ -32,7 +31,6 @@ from infill import (
     NDPBIDiversity,
     RandomSelection,
     SurrogateParetoImprovement,
-    TchebycheffProbabilityOfImprovement,
     USeMOUncertainty,
 )
 from lhs import latin_hypercube_sample
@@ -157,7 +155,6 @@ def resolve_compare_infill_names(args: argparse.Namespace) -> list[str]:
         "ehvi",
         "usemo_uncertainty",
         "spi",
-        "pi",
         "random",
         "nd_a",
         "nd_pbi_convergence",
@@ -198,7 +195,6 @@ def resolve_compare_algo_names(args: argparse.Namespace) -> list[str]:
     allowed = {
         "codein",
         "disc_af",
-        "moead_ego",
         "all",
     }
     tokens = [part.strip().lower().replace("-", "_") for part in raw_text.split(",")]
@@ -210,11 +206,11 @@ def resolve_compare_algo_names(args: argparse.Namespace) -> list[str]:
         if token not in allowed:
             raise ValueError(
                 f"Unsupported compare_algo entry: {token}. "
-                "Expected entries from {'codein','disc_af','moead_ego','all'}."
+                "Expected entries from {'codein','disc_af','all'}."
             )
         if token == "all":
-            for name in ["moead_ego"]:
-                if name not in resolved:
+            for name in ["codein", "disc_af"]:
+                if name != resolve_primary_policy_name(args) and name not in resolved:
                     resolved.append(name)
             continue
         if token not in resolved:
@@ -270,16 +266,12 @@ def compare_infill_display_name(name: str) -> str:
         "usemo_uncertainty": "USeMO-Uncertainty",
         "spi": "SPI",
         "surrogate_pareto_improvement": "SPI",
-        "pi": "PI",
-        "tchebycheff_probability_of_improvement": "PI",
         "random": "RANDOM",
         "nd_a": "ND-A",
         "nd_pbi_convergence": "ND-PBI-Convergence",
         "nd_pbi_diversity": "ND-PBI-Diversity",
         "epdi_exploitation": "EPDI-Exploitation",
         "epdi_exploration": "EPDI-Exploration",
-        "moea_d_ego": "MOEA-D/EGO",
-        "moead_ego": "MOEA-D/EGO",
     }
     key = _normalize_display_key(name)
     return display_map.get(key, key.upper())
@@ -290,8 +282,6 @@ def compare_algo_display_name(name: str) -> str:
         "codein": "CodeIn",
         "disc_af": "DISC w/o candidate pool interaction",
         "nsga2": "NSGA-II",
-        "moead_ego": "MOEA-D/EGO",
-        "moea_d_ego": "MOEA-D/EGO",
     }
     key = _normalize_display_key(name)
     return display_map.get(key, key.upper())
@@ -312,8 +302,6 @@ def canonical_solver_family_name(name: str | None) -> str | None:
     key = str(name).strip().lower().replace("-", "_").replace("/", "_")
     if normalize_solver_name(key) in {"nsga2", "nsga3"}:
         return normalize_solver_name(key)
-    if key in {"moead_ego", "moea_d_ego"}:
-        return "moead_ego"
     return None
 
 
@@ -333,8 +321,6 @@ def build_compare_infill_criterion(name: str, *, ref_point: np.ndarray):
         return USeMOUncertainty()
     if key in {"spi", "surrogate_pareto_improvement"}:
         return SurrogateParetoImprovement()
-    if key in {"pi", "tchebycheff_probability_of_improvement"}:
-        return TchebycheffProbabilityOfImprovement()
     if key == "random":
         return RandomSelection()
     if key == "nd_a":
@@ -375,14 +361,7 @@ def _make_infill_selection_kwargs(
         "candidate_std": candidate_std,
         "seed": int(seed),
     }
-    if offspring_info is not None:
-        candidate_weight_vectors = offspring_info.get("candidate_weight_vectors")
-        if candidate_weight_vectors is not None:
-            kwargs["candidate_weight_vectors"] = np.asarray(
-                candidate_weight_vectors,
-                dtype=np.float32,
-            )
-    del criterion, progress_ratio
+    del criterion, progress_ratio, offspring_info
     return kwargs
 
 
@@ -602,24 +581,16 @@ def generate_offspring_pool(
         seed_x=seed_x,
         **solver_kwargs,
     )
-    metadata = {}
-    if solver_name == "moead_ego":
-        metadata = {
-            "candidate_weight_vectors": np.asarray(result.raw.weight_vectors, dtype=np.float32),
-            "eti": np.asarray(result.acquisition, dtype=np.float32),
-        }
     return (
         np.asarray(result.x, dtype=np.float32),
         np.asarray(result.mean, dtype=np.float32),
         np.asarray(result.std if result.std is not None else surrogate.predict_std(result.x), dtype=np.float32),
         [np.arange(int(result.x.shape[0]), dtype=np.int64)],
-        metadata,
+        {},
     )
 
 
 def resolve_rollout_solver(args, policy_key, infill_criterion):
-    if policy_key == "moead_ego" or isinstance(infill_criterion, TchebycheffProbabilityOfImprovement):
-        return "moead_ego"
     return normalize_solver_name(getattr(args, "solver", DEFAULT_POOL_SOLVER))
 
 
@@ -747,105 +718,6 @@ def build_agent(
     }
 
 
-def prediction_history_kwargs(agent, y_true_history, sigma_true_history):
-    if not bool(getattr(agent, "uses_prediction_history", False)):
-        return {}
-    return {
-        "y_true_history": y_true_history,
-        "sigma_true_history": sigma_true_history,
-    }
-
-
-def build_prediction_history_kwargs(agent, y_history: np.ndarray, sigma_history: np.ndarray, *, device: str):
-    if not bool(getattr(agent, "uses_prediction_history", False)):
-        return {}
-    return {
-        "y_true_history": torch.from_numpy(np.asarray(y_history, dtype=np.float32)).to(
-            device=device,
-            dtype=torch.float32,
-        ),
-        "sigma_true_history": torch.from_numpy(np.asarray(sigma_history, dtype=np.float32)).to(
-            device=device,
-            dtype=torch.float32,
-        ),
-    }
-
-
-def build_trajectory_history_kwargs(
-    agent,
-    state_embeddings: list[torch.Tensor],
-    timesteps: list[float],
-    q_values: list[float],
-    *,
-    device: str,
-) -> dict[str, torch.Tensor]:
-    if not bool(getattr(agent, "uses_trajectory_history", False)) or not state_embeddings:
-        return {}
-    embeddings = torch.stack(state_embeddings, dim=0).unsqueeze(0).to(
-        device=device, dtype=torch.float32
-    )
-    timestep_tensor = torch.tensor(timesteps, device=device, dtype=torch.float32).unsqueeze(0)
-    q_tensor = torch.tensor(q_values, device=device, dtype=torch.float32).unsqueeze(0)
-    mask = torch.ones(1, len(state_embeddings), device=device, dtype=torch.bool)
-    return {
-        "history_state_embeddings": embeddings,
-        "history_timesteps": timestep_tensor,
-        "history_q_values": q_tensor,
-        "history_mask": mask,
-    }
-
-
-def append_trajectory_history(
-    agent,
-    output: dict[str, torch.Tensor],
-    selected_idx: int,
-    progress: float,
-    state_embeddings: list[torch.Tensor],
-    timesteps: list[float],
-    q_values: list[float],
-) -> None:
-    if not bool(getattr(agent, "uses_trajectory_history", False)):
-        return
-    embeddings = output.get("state_action_embeddings")
-    scores = output.get("q_values")
-    if embeddings is None or scores is None:
-        raise RuntimeError("Trajectory-aware agent must return state_action_embeddings and q_values.")
-    state_embeddings.append(embeddings[0, int(selected_idx)].detach().cpu())
-    timesteps.append(float(progress))
-    q_values.append(float(scores[0, int(selected_idx)].detach().cpu().item()))
-
-
-def init_archive_prediction_history(archive_y: np.ndarray, *, history_steps: int = 40) -> tuple[np.ndarray, np.ndarray]:
-    archive_y_arr = np.asarray(archive_y, dtype=np.float32)
-    y_history = np.repeat(archive_y_arr[:, None, :], int(history_steps), axis=1).astype(np.float32)
-    sigma_history = np.zeros_like(y_history, dtype=np.float32)
-    return y_history, sigma_history
-
-
-def append_archive_prediction_history(
-    y_history: np.ndarray,
-    sigma_history: np.ndarray,
-    *,
-    selected_pred: np.ndarray,
-    selected_sigma: np.ndarray,
-    selected_true: np.ndarray,
-    step: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    history_steps = int(np.asarray(y_history).shape[1])
-    pred = np.asarray(selected_pred, dtype=np.float32).reshape(1, -1)
-    sigma = np.asarray(selected_sigma, dtype=np.float32).reshape(1, -1)
-    true = np.asarray(selected_true, dtype=np.float32).reshape(1, -1)
-    new_y_history = np.repeat(pred[:, None, :], history_steps, axis=1).astype(np.float32)
-    new_sigma_history = np.repeat(sigma[:, None, :], history_steps, axis=1).astype(np.float32)
-    eval_step = min(max(int(step), 0), history_steps - 1)
-    new_y_history[:, eval_step:, :] = true[:, None, :]
-    new_sigma_history[:, eval_step:, :] = 0.0
-    return (
-        np.vstack([np.asarray(y_history, dtype=np.float32), new_y_history]).astype(np.float32),
-        np.vstack([np.asarray(sigma_history, dtype=np.float32), new_sigma_history]).astype(np.float32),
-    )
-
-
 @dataclass
 class StepRecord:
     step: int
@@ -912,24 +784,6 @@ def remove_offspring_candidate(
     )
 
 
-def remove_offspring_info_candidate(
-    offspring_info: dict[str, Any],
-    *,
-    selected_idx: int,
-    n_candidates: int,
-) -> dict[str, Any]:
-    """Keep candidate-aligned solver metadata synchronized with a shrinking pool."""
-    updated = dict(offspring_info)
-    for key in ("candidate_weight_vectors", "eti"):
-        value = updated.get(key)
-        if value is None:
-            continue
-        array = np.asarray(value)
-        if array.ndim >= 1 and int(array.shape[0]) == int(n_candidates):
-            updated[key] = np.delete(array, int(selected_idx), axis=0)
-    return updated
-
-
 def run_policy_rollout_batched(
     *,
     args: argparse.Namespace,
@@ -951,7 +805,6 @@ def run_policy_rollout_batched(
 ) -> tuple[dict[str, Any], np.ndarray]:
     archive_x = np.asarray(archive_x_init, dtype=np.float32).copy()
     archive_y = np.asarray(archive_y_init, dtype=np.float32).copy()
-    archive_y_history, archive_sigma_history = init_archive_prediction_history(archive_y, history_steps=40)
     n_evo_steps = int(args.max_fe) - int(args.init_fe)
     batch_size = max(1, int(getattr(args, "batch", 5)))
     fe_history = [int(args.init_fe)]
@@ -964,9 +817,6 @@ def run_policy_rollout_batched(
     hv_history = [hv]
     igd_history = [igd]
     history: list[StepRecord] = []
-    trajectory_state_embeddings: list[torch.Tensor] = []
-    trajectory_timesteps: list[float] = []
-    trajectory_q_values: list[float] = []
     step_rewards: list[float] = []
     if infill_criterion is not None and hasattr(infill_criterion, "reset"):
         infill_criterion.reset()
@@ -1006,29 +856,16 @@ def run_policy_rollout_batched(
                     sample=False, **tensor_policy_state(archive_state, args.device),
                 )
             seed_x = archive_x[indices[0].cpu().numpy()]
-        if policy_key == "moead_ego":
-            offspring_x, offspring_pred, offspring_sigma, offspring_info = propose_moead_ego_candidates(
-                problem=nsga2_problem,
-                archive_x=archive_x,
-                archive_y=archive_y,
-                pop_size=int(args.offspring_size),
-                saea_steps=int(args.saea_steps),
-                batch_size=pool_evals,
-                gp_restarts=3,
-                seed=int(args.seed) + pool_id,
-            )
-            offspring_groups = [np.arange(len(offspring_x), dtype=np.int64)]
-        else:
-            offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
-                args=args,
-                nsga_problem=nsga2_problem,
-                archive_x=archive_x,
-                archive_y=archive_y,
-                step=pool_id,
-                seed_x=seed_x,
-                constraint_surrogate=constraint_gp,
-                solver_name=pool_solver,
-            )
+        offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
+            args=args,
+            nsga_problem=nsga2_problem,
+            archive_x=archive_x,
+            archive_y=archive_y,
+            step=pool_id,
+            seed_x=seed_x,
+            constraint_surrogate=constraint_gp,
+            solver_name=pool_solver,
+        )
         if codein:
             if constraint_gp is not None:
                 g_sur_mean = constraint_gp.predict_mean(offspring_x)
@@ -1053,8 +890,6 @@ def run_policy_rollout_batched(
                     selected_idx = int(disc.choose_candidate(
                         out, sample=args.policy_mode == "softmax_sample", temperature=float(args.temperature)
                     ).item())
-            elif policy_key == "moead_ego":
-                selected_idx = 0
             elif policy_key == "disc_af":
                 if disc is None:
                     raise ValueError("DISC rollout requires a built disc model.")
@@ -1062,21 +897,6 @@ def run_policy_rollout_batched(
                     init_fe=int(args.init_fe),
                     step=int(step),
                     max_fe=int(args.max_fe),
-                )
-                history_kwargs = build_prediction_history_kwargs(
-                    disc,
-                    archive_y_history,
-                    archive_sigma_history,
-                    device=str(args.device),
-                )
-                history_kwargs.update(
-                    build_trajectory_history_kwargs(
-                        disc,
-                        trajectory_state_embeddings,
-                        trajectory_timesteps,
-                        trajectory_q_values,
-                        device=str(args.device),
-                    )
                 )
                 with torch.no_grad():
                     out = disc(
@@ -1090,18 +910,8 @@ def run_policy_rollout_batched(
                         upper_bound=np.full(int(args.dim), float(problem.upper), dtype=np.float32),
                         decode_type=str(args.policy_mode),
                         epsilon=0.05,
-                        **history_kwargs,
                     )
                 selected_idx = int(out["ranking"].reshape(out["ranking"].shape[0], -1)[0, 0].item())
-                append_trajectory_history(
-                    disc,
-                    out,
-                    selected_idx,
-                    progress,
-                    trajectory_state_embeddings,
-                    trajectory_timesteps,
-                    trajectory_q_values,
-                )
             elif infill_criterion is not None:
                 selected_idx, _ = _call_infill_select_index(
                     infill_criterion,
@@ -1124,7 +934,6 @@ def run_policy_rollout_batched(
 
             selected_x = offspring_x[selected_idx : selected_idx + 1]
             selected_pred = offspring_pred[selected_idx]
-            selected_sigma = offspring_sigma[selected_idx]
             selected_true, selected_g = evaluate_objectives_and_constraints(problem, selected_x)
             if codein:
                 g_sur_mean = np.delete(g_sur_mean, selected_idx, axis=0)
@@ -1144,14 +953,6 @@ def run_policy_rollout_batched(
 
             archive_x = np.vstack([archive_x, selected_x]).astype(np.float32)
             archive_y = np.vstack([archive_y, selected_true]).astype(np.float32)
-            archive_y_history, archive_sigma_history = append_archive_prediction_history(
-                archive_y_history,
-                archive_sigma_history,
-                selected_pred=selected_pred,
-                selected_sigma=selected_sigma,
-                selected_true=selected_true,
-                step=step,
-            )
             step += 1
             front, hv, igd = feasible_metrics(archive_y, archive_g, ref_point, true_pareto)
             fe = int(args.init_fe) + step
@@ -1177,18 +978,12 @@ def run_policy_rollout_batched(
 
             log_batch_metrics(logger, record.fe, record.hv, record.igd, prefix)
 
-            old_pool_size = int(offspring_x.shape[0])
             offspring_x, offspring_pred, offspring_sigma, offspring_groups = remove_offspring_candidate(
                 offspring_x,
                 offspring_pred,
                 offspring_sigma,
                 offspring_groups,
                 selected_idx=int(selected_idx),
-            )
-            offspring_info = remove_offspring_info_candidate(
-                offspring_info,
-                selected_idx=int(selected_idx),
-                n_candidates=old_pool_size,
             )
             if (
                 policy_key == "disc_af"
@@ -1285,7 +1080,6 @@ def run_policy_rollout(
 
     archive_x = np.asarray(archive_x_init, dtype=np.float32).copy()
     archive_y = np.asarray(archive_y_init, dtype=np.float32).copy()
-    archive_y_history, archive_sigma_history = init_archive_prediction_history(archive_y, history_steps=40)
     n_evo_steps = int(args.max_fe) - int(args.init_fe)
     fe_history = [int(args.init_fe)]
     archive_g = np.asarray(archive_g_init, dtype=np.float32).copy()
@@ -1297,9 +1091,6 @@ def run_policy_rollout(
     hv_history = [hv]
     igd_history = [igd]
     history: list[StepRecord] = []
-    trajectory_state_embeddings: list[torch.Tensor] = []
-    trajectory_timesteps: list[float] = []
-    trajectory_q_values: list[float] = []
     step_rewards: list[float] = []
     if infill_criterion is not None and hasattr(infill_criterion, "reset"):
         infill_criterion.reset()
@@ -1311,34 +1102,18 @@ def run_policy_rollout(
     for step in range(n_evo_steps):
         policy_key = policy_name.lower()
         offspring_info: dict[str, Any] = {}
-        if policy_key == "moead_ego":
-            offspring_x, offspring_pred, offspring_sigma, moead_info = propose_moead_ego_candidates(
-                problem=nsga2_problem,
-                archive_x=archive_x,
-                archive_y=archive_y,
-                pop_size=int(args.offspring_size),
-                saea_steps=int(args.saea_steps),
-                batch_size=1,
-                gp_restarts=3,
-                seed=int(args.seed) + int(step),
-            )
-            offspring_groups = [np.arange(int(offspring_x.shape[0]), dtype=np.int64)]
-            offspring_info = {
-                "reference_vectors": None if moead_info is None else moead_info.get("reference_vectors")
-            }
-        else:
-            constraint_gp = None
-            if archive_g.shape[1] and pool_solver in {"nsga2", "nsga3"}:
-                constraint_gp = build_surrogate(args, archive_x, archive_g)
-            offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
-                args=args,
-                nsga_problem=nsga2_problem,
-                archive_x=archive_x,
-                archive_y=archive_y,
-                step=step,
-                constraint_surrogate=constraint_gp,
-                solver_name=pool_solver,
-            )
+        constraint_gp = None
+        if archive_g.shape[1] and pool_solver in {"nsga2", "nsga3"}:
+            constraint_gp = build_surrogate(args, archive_x, archive_g)
+        offspring_x, offspring_pred, offspring_sigma, offspring_groups, offspring_info = generate_offspring_pool(
+            args=args,
+            nsga_problem=nsga2_problem,
+            archive_x=archive_x,
+            archive_y=archive_y,
+            step=step,
+            constraint_surrogate=constraint_gp,
+            solver_name=pool_solver,
+        )
         if policy_key == "disc_af":
             if disc is None:
                 raise ValueError("DISC rollout requires a built disc model.")
@@ -1346,21 +1121,6 @@ def run_policy_rollout(
                 init_fe=int(args.init_fe),
                 step=int(step),
                 max_fe=int(args.max_fe),
-            )
-            history_kwargs = build_prediction_history_kwargs(
-                disc,
-                archive_y_history,
-                archive_sigma_history,
-                device=str(args.device),
-            )
-            history_kwargs.update(
-                build_trajectory_history_kwargs(
-                    disc,
-                    trajectory_state_embeddings,
-                    trajectory_timesteps,
-                    trajectory_q_values,
-                    device=str(args.device),
-                )
             )
             with torch.no_grad():
                 out = disc(
@@ -1374,20 +1134,8 @@ def run_policy_rollout(
                     upper_bound=np.full(int(args.dim), float(problem.upper), dtype=np.float32),
                     decode_type=str(args.policy_mode),
                     epsilon=0.05,
-                    **history_kwargs,
                 )
             selected_idx = int(out["ranking"].reshape(out["ranking"].shape[0], -1)[0, 0].item())
-            append_trajectory_history(
-                disc,
-                out,
-                selected_idx,
-                progress,
-                trajectory_state_embeddings,
-                trajectory_timesteps,
-                trajectory_q_values,
-            )
-        elif policy_name.lower() == "moead_ego":
-            selected_idx = 0
         elif infill_criterion is not None:
             selected_idx, _ = _call_infill_select_index(
                 infill_criterion,
@@ -1410,7 +1158,6 @@ def run_policy_rollout(
 
         selected_x = offspring_x[selected_idx : selected_idx + 1]
         selected_pred = offspring_pred[selected_idx]
-        selected_sigma = offspring_sigma[selected_idx]
         selected_true, selected_g = evaluate_objectives_and_constraints(problem, selected_x)
         step_reward = compute_env_reward(
             previous_archive_y=archive_y,
@@ -1427,14 +1174,6 @@ def run_policy_rollout(
 
         archive_x = np.vstack([archive_x, selected_x]).astype(np.float32)
         archive_y = np.vstack([archive_y, selected_true]).astype(np.float32)
-        archive_y_history, archive_sigma_history = append_archive_prediction_history(
-            archive_y_history,
-            archive_sigma_history,
-            selected_pred=selected_pred,
-            selected_sigma=selected_sigma,
-            selected_true=selected_true,
-            step=step,
-        )
         front, hv, igd = feasible_metrics(archive_y, archive_g, ref_point, true_pareto)
         fe = int(args.init_fe) + step + 1
         front_size = len(front)
@@ -1745,7 +1484,7 @@ def main(agent_name: str = "codein") -> None:
             for group, name, label, case_args, model in cases:
                 case_args.seed = seed
                 set_seed(seed)
-                criterion = None if model is not None or name == "moead_ego" else build_compare_infill_criterion(
+                criterion = None if model is not None else build_compare_infill_criterion(
                     name, ref_point=ref_point
                 )
                 result, _ = run_policy_rollout_once(

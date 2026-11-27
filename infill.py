@@ -4,10 +4,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 from pymoo.util.ref_dirs import get_reference_directions
-from scipy.stats import norm
 
 from reward import pareto_front, pareto_improvement_scores, resolve_default_reward_lambda
-from solver.moead_ego import tchebycheff_gaussian_stats
 
 
 def _import_botorch_ehvi():
@@ -166,113 +164,6 @@ class SurrogateParetoImprovement(InfillCriterion):
             )
 
         return pareto_improvement_scores(pareto_front(archive), cand_mean, self.reward_lambda)
-
-
-class TchebycheffProbabilityOfImprovement(InfillCriterion):
-    """Probability of improving each candidate's MOEA/D-EGO subproblem."""
-
-    def __init__(self, *, xi: float = 0.0, eps: float = 1e-12):
-        if float(xi) < 0.0:
-            raise ValueError(f"PI improvement margin xi must be non-negative, got {xi}.")
-        self.xi = float(xi)
-        self.eps = float(max(eps, 0.0))
-
-    def select_index(
-        self,
-        *,
-        archive_y: np.ndarray,
-        candidate_mean: np.ndarray,
-        candidate_std: np.ndarray,
-        seed: int | None = None,
-        candidate_weight_vectors: np.ndarray | None = None,
-    ) -> tuple[int, np.ndarray]:
-        scores = self.score_candidates(
-            archive_y=archive_y,
-            candidate_mean=candidate_mean,
-            candidate_std=candidate_std,
-            seed=seed,
-            candidate_weight_vectors=candidate_weight_vectors,
-        )
-        if scores.size <= 0:
-            raise ValueError("Tchebycheff PI received no candidate scores.")
-        return int(np.argmax(scores)), scores
-
-    def score_candidates(
-        self,
-        *,
-        archive_y: np.ndarray,
-        candidate_mean: np.ndarray,
-        candidate_std: np.ndarray,
-        seed: int | None = None,
-        candidate_weight_vectors: np.ndarray | None = None,
-    ) -> np.ndarray:
-        del seed
-        archive_arr = np.asarray(archive_y, dtype=np.float32)
-        cand_mean = np.asarray(candidate_mean, dtype=np.float32)
-        cand_std = np.asarray(candidate_std, dtype=np.float32)
-        if archive_arr.ndim != 2 or archive_arr.shape[0] <= 0:
-            raise ValueError("Tchebycheff PI requires a non-empty 2D evaluated archive.")
-        if cand_mean.ndim != 2 or cand_mean.shape[0] <= 0:
-            raise ValueError(
-                "Tchebycheff PI requires candidate_mean with shape "
-                "(n_candidates, n_obj)."
-            )
-        if archive_arr.shape[1] != cand_mean.shape[1]:
-            raise ValueError(
-                "archive_y and candidate_mean must have the same objective count, "
-                f"got {archive_arr.shape[1]} and {cand_mean.shape[1]}."
-            )
-        if cand_std.ndim == 1:
-            cand_std = cand_std.reshape(-1, 1)
-        if cand_std.shape != cand_mean.shape:
-            raise ValueError(
-                "candidate_std must match candidate_mean shape, "
-                f"got {cand_std.shape} vs {cand_mean.shape}."
-            )
-        if candidate_weight_vectors is None:
-            raise ValueError(
-                "Tchebycheff PI requires candidate_weight_vectors from solver=moead_ego."
-            )
-        weights = np.asarray(candidate_weight_vectors, dtype=np.float32)
-        if weights.shape != cand_mean.shape:
-            raise ValueError(
-                "candidate_weight_vectors must align one-to-one with candidates; "
-                f"got {weights.shape} vs {cand_mean.shape}."
-            )
-
-        ideal = np.min(archive_arr, axis=0) - 1e-6 * np.maximum(
-            np.std(archive_arr, axis=0), 1.0
-        )
-        archive_scalarized = np.max(
-            weights[:, None, :] * (archive_arr[None, :, :] - ideal[None, None, :]),
-            axis=2,
-        )
-        best_g = np.min(archive_scalarized, axis=1).astype(np.float32)
-        mu_g, sigma_g = tchebycheff_gaussian_stats(
-            mean=cand_mean,
-            std=np.maximum(cand_std, self.eps),
-            weights=weights,
-            z=ideal,
-        )
-
-        mu_g = np.asarray(mu_g, dtype=np.float64).reshape(-1)
-        sigma_g = np.asarray(sigma_g, dtype=np.float64).reshape(-1)
-        threshold = np.asarray(best_g, dtype=np.float64) - self.xi
-        scores = np.empty_like(mu_g)
-        weighted_std = np.abs(weights) * cand_std
-        deterministic = np.max(weighted_std, axis=1) <= self.eps
-        uncertain = ~deterministic
-        scores[uncertain] = norm.cdf(
-            (threshold[uncertain] - mu_g[uncertain]) / sigma_g[uncertain]
-        )
-        deterministic_g = np.max(
-            weights * (cand_mean - ideal.reshape(1, -1)),
-            axis=1,
-        )
-        scores[deterministic] = (
-            deterministic_g[deterministic] <= threshold[deterministic]
-        ).astype(np.float64)
-        return scores.astype(np.float32)
 
 
 class ExpectedHypervolumeImprovement(InfillCriterion):

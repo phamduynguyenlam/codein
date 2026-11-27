@@ -36,7 +36,7 @@ class SolverResult:
 
 SolverFn = Callable[[SolverRequest], SolverResult]
 DEFAULT_POOL_SOLVER = "nsga2"
-POOL_SOLVERS = (DEFAULT_POOL_SOLVER, "nsga3", "moead_ego")
+POOL_SOLVERS = (DEFAULT_POOL_SOLVER, "nsga3")
 
 
 def _surrogate_predict_mean(surrogate, x: np.ndarray) -> np.ndarray:
@@ -93,7 +93,6 @@ def normalize_solver_name(name: str) -> str:
         "nsga_2": "nsga2",
         "nsga_3": "nsga3",
         "nsga_iii": "nsga3",
-        "moead_ego_solver": "moead_ego",
     }
     return aliases.get(normalized, normalized)
 
@@ -148,12 +147,6 @@ def run_solver(solver: str, **kwargs) -> SolverResult:
     return solve(solver, **kwargs)
 
 
-def _require_archive_y(request: SolverRequest, solver_name: str) -> np.ndarray:
-    if request.archive_y is None:
-        raise ValueError(f"solver '{solver_name}' requires archive_y.")
-    return np.asarray(request.archive_y)
-
-
 def _solve_nsga3(request: SolverRequest) -> SolverResult:
     from solver.nsga3 import run_surrogate_nsga3
 
@@ -184,35 +177,7 @@ def _solve_nsga2(request: SolverRequest) -> SolverResult:
     )
 
 
-def _solve_moead_ego(request: SolverRequest) -> SolverResult:
-    from solver.moead_ego import run_surrogate_moead_ego
-
-    archive_y = _require_archive_y(request, "moead_ego")
-    if request.surrogate is None:
-        raise ValueError("solver 'moead_ego' requires a surrogate object with predict_mean/predict_std.")
-    result = run_surrogate_moead_ego(
-        problem=request.problem,
-        archive_x=request.archive_x,
-        archive_y=archive_y,
-        surrogate=request.surrogate,
-        pop_size=int(request.pop_size),
-        saea_steps=int(request.saea_steps),
-        seed=int(request.seed),
-        **request.extra,
-    )
-    return SolverResult(
-        solver="moead_ego",
-        x=np.asarray(result.x),
-        y=np.asarray(result.mean),
-        mean=np.asarray(result.mean),
-        std=np.asarray(result.std),
-        acquisition=np.asarray(result.eti),
-        raw=result,
-    )
-
-
 _SOLVER_REGISTRY: dict[str, SolverFn] = {
-    "moead_ego": _solve_moead_ego,
     "nsga2": _solve_nsga2,
     "nsga3": _solve_nsga3,
 }
