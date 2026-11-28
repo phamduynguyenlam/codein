@@ -1604,16 +1604,21 @@ def train_codein(
         f"solver={cfg.solver}",
         f"surrogate={effective_surrogate_label(cfg)}",
         f"hidden_dim={cfg.hidden_dim}",
+        f"n_heads={cfg.n_heads}",
+        f"ff_dim={cfg.ff_dim}",
+        f"dropout={cfg.dropout:g}",
         f"sampling_backend={'ray' if use_ray else 'process_pool'}",
         f"epochs={logged_epoch_target}",
         f"epochs_to_run={cfg.train_iters}",
         f"saea_steps={cfg.saea_steps}",
+        f"offspring_size={cfg.offspring_size}",
         f"eval_batch_size={cfg.eval_batch_size}",
         f"updates_per_epoch={cfg.updates_per_epoch}",
         f"train_device={cfg.device}",
         f"rollout_device={cfg.rollout_device}",
         f"surrogate_device={cfg.surrogate_device}",
-        f"lr={cfg.lr:.1e}",
+        "optimizer=Adam",
+        f"lr={cfg.lr:g}",
         f"batch_size={cfg.batch_size}",
         f"replay_size={cfg.replay_size}",
         f"gamma={cfg.gamma:.4f}",
@@ -1627,7 +1632,7 @@ def train_codein(
         config_parts.append(f"cuda_cleanup_after_update={int(bool(cfg.cuda_cleanup_after_update))}")
     if codein:
         config_parts.extend([
-            f"num_seeds={cfg.num_seeds}", f"temperature={cfg.temperature:g}",
+            f"parents={cfg.num_seeds}", f"temperature={cfg.temperature:g}",
             f"value_coef={cfg.value_coef:g}", f"q_coef={cfg.q_coef:g}",
             f"offspring_value_coef={cfg.offspring_value_coef:g}",
         ])
@@ -1639,6 +1644,7 @@ def train_codein(
     if codein:
         training_config_message += f" | offspring_value_coef = {cfg.offspring_value_coef:g}"
     log(training_config_message)
+    log("config | " + " | ".join(config_parts))
     replay = ReplayBuffer(cfg.replay_size)
     try:
         for it in range(cfg.train_iters):
